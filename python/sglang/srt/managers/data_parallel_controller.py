@@ -825,6 +825,11 @@ def run_data_parallel_controller_process(
     kill_itself_when_parent_died()
     parent_process = psutil.Process().parent()
 
+    # Foundry mutates server_args; must run before publish() projects the bags.
+    if server_args.foundry_graph_extension_config_path:
+        from sglang.srt.foundry_shim import apply_server_args
+
+        apply_server_args(server_args)
     # This process reads the config namespaces before spawning schedulers.
     publish(server_args, role="dp_controller")
     configure_logger(server_args)

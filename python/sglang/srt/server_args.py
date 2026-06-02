@@ -1824,6 +1824,11 @@ class ServerArgs:
     disable_flashinfer_autotune: A[
         bool, "Disable FlashInfer autotuning.", NS("exec.kernel")
     ] = False
+    foundry_graph_extension_config_path: A[
+        Optional[str],
+        "Path to Foundry CUDA graph extension TOML config.",
+        NS("exec.graph"),
+    ] = None
     flashinfer_autotune_skip_ops: A[
         Optional[List[str]],
         Arg(

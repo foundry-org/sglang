@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.overrides import (
     attention_backends_of,
+    declare_direct_writes,
     declare_resolution,
     model_config_of,
     resolved_view,
@@ -413,6 +414,31 @@ def apply_deepep_adjustments(server_args: Any):
                     max_bs=aligned[-1],
                 ),
             )
+
+
+def handle_graph_extension(server_args: Any):
+    """Out-of-tree CUDA-graph persistence (Foundry) overrides graph-related
+    fields; must run before handle_cuda_graph_config so resolution sees them."""
+
+    cfg = resolving_view(server_args)
+    if not cfg.foundry_graph_extension_config_path:
+        return
+
+    def apply_foundry_constraints(sa: Any):
+        # Foundry persists full decode graphs only: prefill capture (BCG is
+        # the CUDA default) is not covered by its archive format, and
+        # autotune/profiling must stay off so SAVE and LOAD take identical
+        # allocation paths.
+        sa.cuda_graph_backend_decode = "full"
+        sa.cuda_graph_backend_prefill = "disabled"
+        sa.enable_profile_cuda_graph = False
+        sa.disable_flashinfer_autotune = True
+
+        from sglang.srt.foundry_shim import apply_server_args
+
+        apply_server_args(sa)
+
+    declare_direct_writes(server_args, "foundry", apply_foundry_constraints)
 
 
 def apply_inkling_prefill_cuda_graph_default(server_args: Any):

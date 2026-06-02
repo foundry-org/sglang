@@ -181,8 +181,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         handle_cuda_graph_config,
+        handle_graph_extension,
     )
 
+    handle_graph_extension(server_args)
     apply_inkling_prefill_cuda_graph_default(server_args)
     apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args)
 
