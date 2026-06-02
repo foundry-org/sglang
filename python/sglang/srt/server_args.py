@@ -581,6 +581,7 @@ class ServerArgs:
     )
     dsa_topk_backend: str = "sgl-kernel"
     disable_flashinfer_autotune: bool = False
+    foundry_graph_extension_config_path: Optional[str] = None
     mamba_backend: str = "triton"
 
     # Speculative decoding
@@ -933,6 +934,11 @@ class ServerArgs:
         from sglang.srt.platforms import current_platform
 
         current_platform.apply_server_args_defaults(self)
+
+        if self.foundry_graph_extension_config_path:
+            from sglang.srt.foundry_shim import apply_server_args
+
+            apply_server_args(self)
 
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
@@ -5700,6 +5706,12 @@ class ServerArgs:
             default=ServerArgs.disable_flashinfer_autotune,
             action="store_true",
             help="Disable FlashInfer autotuning.",
+        )
+        parser.add_argument(
+            "--foundry-graph-extension-config-path",
+            type=str,
+            default=ServerArgs.foundry_graph_extension_config_path,
+            help="Path to Foundry CUDA graph extension TOML config.",
         )
 
         # Speculative decoding

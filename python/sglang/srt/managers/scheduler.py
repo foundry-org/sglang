@@ -3962,6 +3962,10 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    if server_args.foundry_graph_extension_config_path:
+        from sglang.srt.foundry_shim import apply_server_args
+
+        apply_server_args(server_args)
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,

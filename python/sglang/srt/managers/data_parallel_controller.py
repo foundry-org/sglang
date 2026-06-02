@@ -666,6 +666,10 @@ def run_data_parallel_controller_process(
     parent_process = psutil.Process().parent()
 
     configure_logger(server_args)
+    if server_args.foundry_graph_extension_config_path:
+        from sglang.srt.foundry_shim import apply_server_args
+
+        apply_server_args(server_args)
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")
         thread_label = "DP Controller"
