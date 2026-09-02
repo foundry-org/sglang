@@ -114,13 +114,27 @@ class TorchSymmMemCommunicator:
         )
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
         if handle.multicast_ptr == 0:
+            # Only the multimem kernel needs a multicast mapping; two-shot runs
+            # on plain peer pointers. Multicast can be unavailable while p2p
+            # works (e.g. NVSwitch fabric-handle multicast without IMEX
+            # channels configured), so disable only the world sizes that
+            # all_reduce would route to multimem.
+            if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
+                self.device_capability, ()
+            ):
+                logger.warning(
+                    "TorchSymmMemCommunicator: torch symmetric memory "
+                    "multicast operations are not supported; world size %d "
+                    "requires the multimem kernel, communicator disabled.",
+                    self.world_size,
+                )
+                self.buffer = None
+                self.disabled = True
+                return
             logger.warning(
-                "TorchSymmMemCommunicator: torch symmetric memory "
-                "multicast operations are not supported."
+                "TorchSymmMemCommunicator: multicast unavailable; "
+                "using the two-shot all-reduce kernel."
             )
-            self.buffer = None
-            self.disabled = True
-            return
         self.disabled = False
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
