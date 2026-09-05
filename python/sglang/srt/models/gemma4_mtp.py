@@ -91,7 +91,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             2 * self.backbone_hidden_size,
             self.hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("pre_projection", prefix),
         )
         self.model = Gemma4TextModel(
@@ -103,7 +103,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             self.hidden_size,
             self.backbone_hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=add_prefix("post_projection", prefix),
         )
 
@@ -397,4 +397,8 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         )
 
 
-EntryClass = Gemma4AssistantForCausalLM
+class Gemma4UnifiedAssistantForCausalLM(Gemma4AssistantForCausalLM):
+    """Gemma 4 unified MTP assistant; text path identical to the gemma4 assistant."""
+
+
+EntryClass = [Gemma4AssistantForCausalLM, Gemma4UnifiedAssistantForCausalLM]

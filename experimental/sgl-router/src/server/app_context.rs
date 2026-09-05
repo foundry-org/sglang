@@ -4,6 +4,7 @@
 use crate::config::Config;
 
 use crate::policies::active_load::ActiveLoadRegistry;
+use crate::policies::kv_events::BlockSizeOracle;
 use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::metrics::MetricsRegistry;
@@ -12,7 +13,6 @@ use crate::workers::WorkerRegistry;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-#[derive(Debug)]
 pub struct AppContext {
     pub config: Config,
     pub tokenizers: Arc<TokenizerRegistry>,
@@ -30,6 +30,8 @@ pub struct AppContext {
     /// (active_load gauge + stale_requests_total), and PD resolver
     /// (decode_affinity_total).
     pub metrics: Arc<MetricsRegistry>,
+    pub prefix_index: Option<Arc<sgl_kv_indexer::GrpcPrefixIndex>>,
+    pub block_size_oracle: Arc<BlockSizeOracle>,
     ready: AtomicBool,
 }
 
@@ -69,6 +71,11 @@ impl AppContext {
         // Without this, the metric is permanently 0 in production even
         // though the chat handler is faithfully calling `register`.
         active_load.attach_metrics(Arc::clone(&metrics));
+        // Same rationale for the cache-aware-zmq policy's
+        // `sgl_router_overlap_blocks`: the metrics registry is built here,
+        // after the policy registry, so inject it now. No-op for policies
+        // that don't emit metrics.
+        policies.attach_metrics(Arc::clone(&metrics));
         Self {
             config,
             tokenizers,
@@ -77,6 +84,8 @@ impl AppContext {
             policies,
             active_load,
             metrics,
+            prefix_index: None,
+            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }
@@ -100,14 +109,19 @@ impl AppContext {
                     port: 0,
                 },
                 observability: Default::default(),
-                models: vec![],
-                discovery: crate::config::DiscoveryConfig {
-                    backend: crate::config::DiscoveryBackend::StaticUrls(
-                        crate::config::StaticUrlsDiscoveryConfig {
-                            urls: vec!["http://placeholder:0".into()],
-                        },
-                    ),
+                model: crate::config::ModelConfig {
+                    id: "stub-model".into(),
+                    tokenizer_path: "stub".into(),
+                    policy: crate::config::PolicyKind::RoundRobin,
+                    circuit_breaker: None,
+                    cache_aware: None,
+                    sticky: None,
                 },
+                discovery: crate::config::DiscoveryBackend::StaticUrls(
+                    crate::config::StaticUrlsDiscoveryConfig {
+                        urls: vec!["http://placeholder:0".into()],
+                    },
+                ),
                 proxy: crate::config::ProxyConfig::default(),
                 active_load: crate::config::ActiveLoadConfig::default(),
             },
@@ -117,6 +131,8 @@ impl AppContext {
             policies: Arc::new(PolicyRegistry::default()),
             active_load: ActiveLoadRegistry::with_defaults(),
             metrics: MetricsRegistry::new(),
+            prefix_index: None,
+            block_size_oracle: BlockSizeOracle::new(),
             ready: AtomicBool::new(false),
         }
     }

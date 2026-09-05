@@ -1,23 +1,28 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Single-shot `/server_info` introspection for newly-discovered workers.
+//! Introspection for newly-discovered workers.
 //!
-//! Combines what used to be two separate round-trips (the worker
-//! manager's `served_model_name` fetch and `KvEventIndex::add_worker`'s
-//! `fetch_event_config`) into one HTTP request. The result is dispatched
-//! by the manager: registry consumes `served_model_name`, the optional
-//! `KvEventIndex` consumes the resolved `EventConfig`.
+//! Two concurrent requests, because the worker answers two different
+//! questions on two different endpoints: `/model_info` reports the identity
+//! the worker currently serves under (a weight update moves it), while
+//! `/server_info` reports its launch configuration — kv-event publisher and
+//! disaggregation role. The result is dispatched by the manager: registry
+//! consumes `served_model_name`, the optional `KvEventIndex` consumes the
+//! resolved `EventConfig`.
+//!
+//! `served_model_name` is taken from `/model_info`, falling back to
+//! `/server_info` for workers that predate the field there.
 //!
 //! # Failure semantics
 //!
 //! `fetch` is **infallible** — any error (network, non-2xx, JSON parse,
-//! invalid worker URL) is logged at `warn!` and returns an empty
-//! `ServerInfo` so the caller can register the worker with empty
-//! `model_ids` and no kv-events attachment. Workers that need accuracy
-//! around publisher availability use `kv_events::discovery::fetch_event_config`
-//! directly (it returns `Result<Option<EventConfig>>`); the manager
-//! intentionally doesn't.
+//! invalid worker URL) is logged and yields `None` for whatever that request
+//! was carrying, so the caller can register the worker with empty `model_ids`
+//! and no kv-events attachment. The two requests fail independently. Workers
+//! that need accuracy around publisher availability use
+//! `kv_events::discovery::fetch_event_config` directly (it returns
+//! `Result<Option<EventConfig>>`); the manager intentionally doesn't.
 
 use std::time::Duration;
 
@@ -68,9 +73,9 @@ pub enum DisaggregationRole {
     Decode,
 }
 
-/// Performs the single `/server_info` round-trip and projects the
-/// response into both halves of `ServerInfo`. Cheap to clone — wraps a
-/// `reqwest::Client` (which is internally `Arc`-backed).
+/// Performs the two round-trips concurrently and projects the responses into
+/// `ServerInfo`. Cheap to clone — wraps a `reqwest::Client` (which is
+/// internally `Arc`-backed).
 #[derive(Clone)]
 pub struct WorkerIntrospector {
     client: reqwest::Client,
@@ -95,9 +100,9 @@ impl WorkerIntrospector {
         Self { client }
     }
 
-    /// Fetch `/server_info` for the worker.  Never returns an error:
-    /// any failure is logged at `warn!` and yields a default
-    /// `ServerInfo` with both halves `None`. Callers register the
+    /// Fetch `/model_info` and `/server_info` for the worker, concurrently.
+    /// Never returns an error: any failure is logged at `warn!` and yields
+    /// `None` for the fields that request carried. Callers register the
     /// worker with empty model IDs and no event subscription on the
     /// failure path; future re-discovery will retry.
     ///
@@ -106,28 +111,41 @@ impl WorkerIntrospector {
     /// responses and JSON-parse errors short-circuit immediately —
     /// the worker answered authoritatively, retrying won't help.
     pub async fn fetch(&self, worker_url: &str) -> ServerInfo {
-        let server_info_url = format!("{}/server_info", worker_url.trim_end_matches('/'));
-        let parsed = match Self::fetch_with_retry(&self.client, &server_info_url, worker_url).await
-        {
-            Some(p) => p,
-            None => return ServerInfo::default(),
-        };
+        let base = worker_url.trim_end_matches('/');
+        let server_info_url = format!("{base}/server_info");
+        let model_info_url = format!("{base}/model_info");
+        let (parsed, model_info) = tokio::join!(
+            Self::fetch_with_retry::<ServerInfoBody>(&self.client, &server_info_url, worker_url),
+            Self::fetch_with_retry::<ModelInfoBody>(&self.client, &model_info_url, worker_url),
+        );
+        // A worker that answers one endpoint and not the other still gets
+        // registered with whatever did answer.
+        let parsed = parsed.unwrap_or_default();
 
-        let served_model_name = match parsed.served_model_name {
-            Some(name) if !name.is_empty() => Some(name),
-            Some(_) => {
-                warn!(
-                    worker_url = %worker_url,
-                    "introspect: /server_info has empty `served_model_name`; registering worker with empty model_ids"
-                );
-                None
-            }
-            None => None,
-        };
+        // `/model_info` is the effective identity; `/server_info` is the launch
+        // record, kept as the fallback for workers that predate the field
+        // there. An empty string is the same as absent on either.
+        let non_empty = |name: String| Some(name).filter(|name| !name.is_empty());
+        let served_model_name = model_info
+            .and_then(|body| body.served_model_name)
+            .and_then(non_empty)
+            .or_else(|| parsed.served_model_name.and_then(non_empty));
+        if served_model_name.is_none() {
+            warn!(
+                worker_url = %worker_url,
+                "introspect: no `served_model_name` on /model_info or /server_info; registering worker with empty model_ids"
+            );
+        }
 
+        // EAGLE-family speculative decoding ⇒ the worker hashes KV blocks over
+        // token bigrams; the router must mirror that on the selection side.
+        let is_bigram = crate::policies::kv_events::classify_bigram(
+            parsed.speculative_algorithm.as_deref(),
+            worker_url,
+        );
         let event_config = parsed
             .kv_events
-            .map(|block| resolve_event_config(block, worker_url));
+            .map(|block| resolve_event_config(block, worker_url, is_bigram));
 
         let disaggregation_role = resolve_disaggregation_role(
             parsed.disaggregation_mode.as_deref(),
@@ -142,48 +160,53 @@ impl WorkerIntrospector {
         }
     }
 
-    /// Issue the `/server_info` GET with bounded retry on transient
-    /// errors. Returns `Some(body)` on success, `None` after exhausting
-    /// retries (the caller falls back to default `ServerInfo`).
-    async fn fetch_with_retry(
+    /// Issue one introspection GET with bounded retry on transient errors.
+    /// Returns `Some(body)` on success, `None` after exhausting retries or on
+    /// an authoritative answer (4xx, unparsable JSON). The caller decides what
+    /// a missing body costs — each endpoint carries different fields.
+    async fn fetch_with_retry<T: serde::de::DeserializeOwned>(
         client: &reqwest::Client,
-        server_info_url: &str,
+        url: &str,
         worker_url: &str,
-    ) -> Option<ServerInfoBody> {
+    ) -> Option<T> {
         let mut delay = FETCH_BACKOFF_BASE;
         for attempt in 1..=FETCH_MAX_ATTEMPTS {
-            match client.get(server_info_url).send().await {
+            match client.get(url).send().await {
                 Err(e) => {
                     warn!(
                         worker_url = %worker_url,
+                        url = %url,
                         attempt,
                         error = %e,
-                        "introspect: /server_info request failed; will retry"
+                        "introspect: request failed; will retry"
                     );
                 }
                 Ok(resp) if resp.status().is_server_error() => {
                     warn!(
                         worker_url = %worker_url,
+                        url = %url,
                         attempt,
                         status = %resp.status(),
-                        "introspect: /server_info returned 5xx; will retry"
+                        "introspect: returned 5xx; will retry"
                     );
                 }
                 Ok(resp) if !resp.status().is_success() => {
                     warn!(
                         worker_url = %worker_url,
+                        url = %url,
                         status = %resp.status(),
-                        "introspect: /server_info returned non-2xx; registering worker with empty model_ids"
+                        "introspect: returned non-2xx; treating the endpoint as absent"
                     );
                     return None;
                 }
-                Ok(resp) => match resp.json::<ServerInfoBody>().await {
+                Ok(resp) => match resp.json::<T>().await {
                     Ok(body) => return Some(body),
                     Err(e) => {
                         warn!(
                             worker_url = %worker_url,
+                            url = %url,
                             error = %e,
-                            "introspect: /server_info JSON parse failed; registering worker with empty model_ids"
+                            "introspect: JSON parse failed; treating the endpoint as absent"
                         );
                         return None;
                     }
@@ -196,8 +219,9 @@ impl WorkerIntrospector {
         }
         warn!(
             worker_url = %worker_url,
+            url = %url,
             attempts = FETCH_MAX_ATTEMPTS,
-            "introspect: /server_info failed after retries; registering worker with empty model_ids"
+            "introspect: failed after retries; treating the endpoint as absent"
         );
         None
     }
@@ -265,7 +289,11 @@ impl Default for WorkerIntrospector {
 /// unchanged: the subsequent ZMQ connect will fail visibly with the
 /// wildcard literal, which is the same observable failure mode that
 /// would occur today if the bind/connect were skipped.
-pub(crate) fn resolve_event_config(block: KvEventsBlock, worker_url: &str) -> EventConfig {
+pub(crate) fn resolve_event_config(
+    block: KvEventsBlock,
+    worker_url: &str,
+    is_bigram: bool,
+) -> EventConfig {
     let host = if matches!(
         block.endpoint_host.as_str(),
         "*" | "0.0.0.0" | "::" | "[::]"
@@ -292,7 +320,16 @@ pub(crate) fn resolve_event_config(block: KvEventsBlock, worker_url: &str) -> Ev
         topic: block.topic,
         block_size: block.block_size,
         dp_size: block.dp_size,
+        is_bigram,
     }
+}
+
+/// Projection of `/model_info` used by the introspector: the identity the
+/// worker currently serves under, which a weight update moves.
+#[derive(Debug, Default, Deserialize)]
+struct ModelInfoBody {
+    #[serde(default)]
+    served_model_name: Option<String>,
 }
 
 /// Projection of `/server_info` used by the introspector. Every field is
@@ -300,10 +337,17 @@ pub(crate) fn resolve_event_config(block: KvEventsBlock, worker_url: &str) -> Ev
 /// deserialises; downstream callers handle `None` as "absent".
 #[derive(Debug, Default, Deserialize)]
 struct ServerInfoBody {
+    /// The launch record's value, and the fallback for a worker whose
+    /// `/model_info` predates the field.
     #[serde(default)]
     served_model_name: Option<String>,
     #[serde(default)]
     kv_events: Option<KvEventsBlock>,
+    /// Top-level `speculative_algorithm`. EAGLE-family values
+    /// (EAGLE / EAGLE3 / FROZEN_KV_MTP) ⇒ the worker hashes KV blocks over
+    /// token bigrams. Absent on workers without speculative decoding.
+    #[serde(default)]
+    speculative_algorithm: Option<String>,
     /// Carries the value of `ServerArgs.disaggregation_mode`
     /// (`"null"` | `"prefill"` | `"decode"`). Absent on older SGLang
     /// versions that predate the field.
@@ -343,17 +387,36 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
+    /// A worker that serves `/server_info` only: an SGLang that predates
+    /// `served_model_name` on `/model_info`.
     async fn spawn_fake_worker(body: Value) -> (String, oneshot::Sender<()>) {
-        let body = Arc::new(body);
+        spawn_fake_worker_with_model_info(body, None).await
+    }
+
+    async fn spawn_fake_worker_with_model_info(
+        server_info: Value,
+        model_info: Option<Value>,
+    ) -> (String, oneshot::Sender<()>) {
+        let body = Arc::new(server_info);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let app = Router::new().route(
+        let mut app = Router::new().route(
             "/server_info",
             get(move || {
                 let body = body.clone();
                 async move { Json((*body).clone()) }
             }),
         );
+        if let Some(model_info) = model_info {
+            let model_info = Arc::new(model_info);
+            app = app.route(
+                "/model_info",
+                get(move || {
+                    let model_info = model_info.clone();
+                    async move { Json((*model_info).clone()) }
+                }),
+            );
+        }
         let (tx, rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app)
@@ -367,6 +430,59 @@ mod tests {
 
     fn fast_introspector() -> WorkerIntrospector {
         WorkerIntrospector::new(Duration::from_millis(500))
+    }
+
+    /// The PRIMARY `/server_info` path (the introspector, not the discovery.rs
+    /// fallback) must flag `is_bigram` for an EAGLE worker so the policy picks
+    /// the bigram hasher. Regression guard for the duplicated parse + the
+    /// `resolve_event_config(.., is_bigram)` threading.
+    #[tokio::test]
+    async fn fetch_sets_is_bigram_for_eagle_worker() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "speculative_algorithm": "EAGLE",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        assert!(
+            cfg.is_bigram,
+            "EAGLE worker via the introspector must set is_bigram"
+        );
+    }
+
+    /// A non-speculative worker (no `speculative_algorithm`) must NOT be bigram.
+    #[tokio::test]
+    async fn fetch_no_bigram_without_speculative_algorithm() {
+        let (url, _shutdown) = spawn_fake_worker(json!({
+            "served_model_name": "m",
+            "kv_events": {
+                "publisher": "zmq",
+                "endpoint_host": "*",
+                "endpoint_port_base": 5557,
+                "topic": "",
+                "block_size": 64,
+                "dp_size": 1,
+            }
+        }))
+        .await;
+        let cfg = fast_introspector()
+            .fetch(&url)
+            .await
+            .event_config
+            .expect("kv_events present");
+        assert!(!cfg.is_bigram, "non-speculative worker must not be bigram");
     }
 
     #[tokio::test]
@@ -429,6 +545,82 @@ mod tests {
             got.event_config.is_none(),
             "event_config must be None on connection refused"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_prefers_model_info_over_server_info_for_the_name() {
+        let (url, _shutdown) = spawn_fake_worker_with_model_info(
+            json!({"served_model_name": "at-launch"}),
+            Some(json!({"served_model_name": "after-weight-update"})),
+        )
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(
+            got.served_model_name.as_deref(),
+            Some("after-weight-update")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_falls_back_to_server_info_when_model_info_lacks_the_name() {
+        let (url, _shutdown) = spawn_fake_worker_with_model_info(
+            json!({"served_model_name": "at-launch"}),
+            Some(json!({"model_path": "/models/m"})),
+        )
+        .await;
+        let got = fast_introspector().fetch(&url).await;
+        assert_eq!(got.served_model_name.as_deref(), Some("at-launch"));
+    }
+
+    /// An empty name on either surface is the same as absent.
+    #[tokio::test]
+    async fn fetch_treats_an_empty_name_as_absent_on_both() {
+        let (url, _shutdown) = spawn_fake_worker_with_model_info(
+            json!({"served_model_name": "at-launch"}),
+            Some(json!({"served_model_name": ""})),
+        )
+        .await;
+        assert_eq!(
+            fast_introspector()
+                .fetch(&url)
+                .await
+                .served_model_name
+                .as_deref(),
+            Some("at-launch"),
+        );
+
+        let (url, _shutdown) =
+            spawn_fake_worker_with_model_info(json!({"served_model_name": ""}), None).await;
+        assert!(fast_introspector()
+            .fetch(&url)
+            .await
+            .served_model_name
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_keeps_the_name_when_server_info_is_absent() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new().route(
+            "/model_info",
+            get(|| async { Json(json!({"served_model_name": "m"})) }),
+        );
+        let (tx, rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = rx.await;
+                })
+                .await;
+        });
+        let _shutdown = tx;
+        let got = fast_introspector()
+            .fetch(&format!("http://127.0.0.1:{port}"))
+            .await;
+        assert_eq!(got.served_model_name.as_deref(), Some("m"));
+        assert!(got.event_config.is_none());
+        assert!(got.disaggregation_role.is_none());
     }
 
     #[tokio::test]

@@ -1,9 +1,9 @@
 import logging
 
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import (
     get_device_sm,
-    is_blackwell_supported,
     is_cuda,
     is_musa,
 )
@@ -34,6 +34,6 @@ def _compute_enable_deep_gemm():
 
 ENABLE_JIT_DEEPGEMM = _compute_enable_deep_gemm()
 
-DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and is_blackwell_supported()
+DEEPGEMM_BLACKWELL = ENABLE_JIT_DEEPGEMM and get_platform().is_sm100
 DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL
 DEEPGEMM_NEED_TMA_ALIGNED_SCALES = not (DEEPGEMM_SCALE_UE8M0 or _is_musa)

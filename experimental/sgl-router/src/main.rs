@@ -3,17 +3,9 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use sgl_router::config::LogFormat;
-use std::path::PathBuf;
+use sgl_router::config::{Cli, LogFormat};
 use std::sync::Arc;
 use tokio::signal::unix::{signal, Signal, SignalKind};
-
-#[derive(Parser, Debug)]
-#[command(name = "sgl-router", version)]
-struct Cli {
-    #[arg(long, env = "SGL_ROUTER_CONFIG")]
-    config: PathBuf,
-}
 
 /// Install the global tracing subscriber.
 ///
@@ -54,13 +46,13 @@ fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
     Ok(())
 }
 
-/// Install a minimal text-format subscriber BEFORE config parsing so a
-/// config-load error has somewhere to surface. The real subscriber
+/// Install a minimal text-format subscriber BEFORE config resolution so a
+/// config-resolution error has somewhere to surface. The real subscriber
 /// (driven by `Config.observability`) is installed after; the second
 /// `try_init` is a no-op because a subscriber is already present.
 /// The bootstrap subscriber respects `RUST_LOG` so an operator can
-/// debug startup with `RUST_LOG=debug` even when the config file is
-/// missing or malformed.
+/// debug startup with `RUST_LOG=debug` even when configuration resolution
+/// fails.
 fn install_bootstrap_subscriber() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -83,12 +75,13 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Bootstrap subscriber so a Config::from_path error has structured
+    // Bootstrap subscriber so a config-resolution error has structured
     // output. The configured-format subscriber installs after this and
     // becomes a no-op via try_init's idempotency.
     install_bootstrap_subscriber();
-    let cfg = sgl_router::config::Config::from_path(&cli.config)
-        .with_context(|| format!("load config from {}", cli.config.display()))?;
+    let cfg = cli
+        .into_config()
+        .context("resolve configuration from CLI flags")?;
 
     init_tracing(&cfg.observability.log_level, cfg.observability.log_format)?;
 
@@ -105,19 +98,43 @@ async fn main() -> Result<()> {
     );
 
     let registry = Arc::new(sgl_router::workers::WorkerRegistry::default());
+    let prefix_index = cfg
+        .model
+        .cache_aware
+        .as_ref()
+        .and_then(|cache| cache.kv_indexer_endpoint.as_ref())
+        .map(|indexer| {
+            let config = sgl_kv_indexer::PrefixIndexConfig {
+                endpoint: indexer.url.clone(),
+                query_deadline: std::time::Duration::from_millis(indexer.query_timeout_ms),
+                max_inflight: indexer.query_max_inflight,
+            };
+            sgl_kv_indexer::GrpcPrefixIndex::new(config)
+                .map(Arc::new)
+                .context("configure KV Indexer client")
+        })
+        .transpose()?;
 
     // Build the KV-event index up front so the cache-aware-zmq policy can
-    // share its `HashTree` handle + `BlockSizeOracle`. When no model uses
-    // `cache_aware_zmq`, the index is still constructed (cheap) but no
-    // subscribers are ever added.
+    // share its `HashTree` handle + `BlockSizeOracle`. An external Indexer makes
+    // the local tree irrelevant to routing, so only discover hash metadata rather
+    // than duplicating every KV event.
     let block_size_oracle = sgl_router::policies::kv_events::BlockSizeOracle::new();
-    let kv_index = sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("default http client builds"),
-        Arc::clone(&block_size_oracle),
-    );
+    let kv_event_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .expect("default http client builds");
+    let kv_index = if prefix_index.is_some() {
+        sgl_router::policies::kv_events::KvEventIndex::new_metadata_only_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    } else {
+        sgl_router::policies::kv_events::KvEventIndex::new_with_http_and_oracle(
+            kv_event_http,
+            Arc::clone(&block_size_oracle),
+        )
+    };
     let policies = Arc::new(
         sgl_router::policies::factory::build_registry(
             &cfg,
@@ -170,16 +187,17 @@ async fn main() -> Result<()> {
         .context("build proxy client")?,
     );
 
-    let ctx = Arc::new(
-        sgl_router::server::app_context::AppContext::with_active_load(
-            cfg.clone(),
-            tokenizers,
-            proxy,
-            registry,
-            policies,
-            active_load,
-        ),
+    let mut app_ctx = sgl_router::server::app_context::AppContext::with_active_load(
+        cfg.clone(),
+        tokenizers,
+        proxy,
+        registry,
+        policies,
+        active_load,
     );
+    app_ctx.prefix_index = prefix_index;
+    app_ctx.block_size_oracle = block_size_oracle;
+    let ctx = Arc::new(app_ctx);
     ctx.mark_ready();
 
     let app = sgl_router::server::app::build_router(ctx.clone());
