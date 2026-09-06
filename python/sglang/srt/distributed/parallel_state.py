@@ -2732,6 +2732,12 @@ def initialize_model_parallel(
             backend,
             use_custom_allreduce=False,
             group_name="self_pp",
+            # Elastic EP scale joiners build groups in local rank space; without the
+            # offset the joiner (global rank >= offset) is in none of these singleton
+            # groups and GroupCoordinator asserts cpu_group is not None.
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
         )
 
     get_parallel().stamp_derived_widths(**derived_widths)

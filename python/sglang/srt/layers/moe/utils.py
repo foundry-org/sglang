@@ -583,6 +583,11 @@ def is_deepep_class_backend() -> bool:
         or b.is_mooncake()
         or b.is_mori()
         or b.is_pplx()
+        # NIXL-EP combines inside its dispatcher like DeepEP; without this the
+        # Qwen3-MoE forward_normal path adds a post-experts EP all-reduce that
+        # idle DP-attention ranks never issue, deadlocking the first step where
+        # one rank has tokens and another is idle.
+        or b.is_nixl()
     )
 
 

@@ -170,6 +170,7 @@ class NixlEPBuffer:
         state.buffer = Buffer(
             rank=global_rank,
             tcp_store_group=tcp_store,
+            timeout_ms=envs.SGLANG_NIXL_EP_TIMEOUT_MS.get(),
         )
 
         state.buffer.update_memory_buffers(

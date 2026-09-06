@@ -1103,6 +1103,9 @@ class Envs:
     SGLANG_DISABLE_STATIC_WATERFILL = EnvBool(False)
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # NIXL-EP low-latency kernel timeout; a timeout marks the peer rank faulted, so it
+    # must exceed any first-call JIT compile (DeepGEMM) that can stall a rank mid-step.
+    SGLANG_NIXL_EP_TIMEOUT_MS = EnvInt(30_000)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # DeepSeek/GLM MoE (deepseek_v2.py): quantize the (dp-gathered) MoE input
