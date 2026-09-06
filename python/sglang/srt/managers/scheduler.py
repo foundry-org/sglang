@@ -514,6 +514,23 @@ class Scheduler(
         # Init metrics stats
         self.init_metrics_collector(tp_rank, pp_rank, dp_rank)
 
+        # Standby gate (experiment, SGLANG_STANDBY_GATE=<path>): everything above
+        # is cluster-independent, so a pre-started process can wait here with
+        # imports, model config and CUDA context already paid, and take over a
+        # failed rank when the gate file appears. Must sit before the ZMQ
+        # connects below, or the standby would steal traffic from the live rank.
+        standby_gate = os.environ.get("SGLANG_STANDBY_GATE")
+        if standby_gate:
+            torch.cuda.set_device(gpu_id)
+            torch.empty(1, device="cuda")
+            logger.info(f"[standby] ready; waiting for gate {standby_gate}")
+            standby_tic = time.perf_counter()
+            while not os.path.exists(standby_gate):
+                time.sleep(0.02)
+            logger.info(
+                f"[standby] gate opened after {time.perf_counter() - standby_tic:.1f} s; resuming init"
+            )
+
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
