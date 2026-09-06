@@ -4435,19 +4435,34 @@ class PortArgs:
             )
             try:
                 if dp_rank is None:
-                    if not (is_joiner or dist_init_overridden):
-                        wait_port_available(dist_init_port, "dist_init_port")
-                    wait_port_available(port_base, "port_base")
-                    wait_port_available(detokenizer_port, "detokenizer_port")
+                    # Only node 0 binds these endpoints: the TCPStore at
+                    # dist_init_port, and the tokenizer / detokenizer / rpc /
+                    # metrics / load-collector / DPC sockets derived from
+                    # port_base. Every other node *connects* to them, so they
+                    # must carry the same numbers there and prechecking them
+                    # would only false-positive when several nodes share one
+                    # host (e.g. the elastic EP recovery test relaunching
+                    # node 1 next to node 0). nccl_port is bound per dp rank on
+                    # every node (launch_dp_schedulers), so it is always checked.
                     if not dist_init_overridden:
                         wait_port_available(nccl_port, "nccl_port")
-                    wait_port_available(rpc_port, "rpc_port")
-                    wait_port_available(metrics_port, "metrics_port")
-                    if server_args.nnodes > 1:
-                        wait_port_available(load_collector_port, "load_collector_port")
+                    if server_args.node_rank == 0:
+                        if not (is_joiner or dist_init_overridden):
+                            wait_port_available(dist_init_port, "dist_init_port")
+                        wait_port_available(port_base, "port_base")
+                        wait_port_available(detokenizer_port, "detokenizer_port")
+                        wait_port_available(rpc_port, "rpc_port")
+                        wait_port_available(metrics_port, "metrics_port")
+                        if server_args.nnodes > 1:
+                            wait_port_available(
+                                load_collector_port, "load_collector_port"
+                            )
                 # Check scheduler_input_port only for dp.
                 # Skip check when using worker_ports since the port is already bound by our ZMQ socket
-                if dp_rank is None or worker_ports is None:
+                # Also bound by node 0 (tokenizer -> DPC / DPC -> workers).
+                if (
+                    dp_rank is None or worker_ports is None
+                ) and server_args.node_rank == 0:
                     wait_port_available(scheduler_input_port, "scheduler_input_port")
             except ValueError:
                 logger.exception(
