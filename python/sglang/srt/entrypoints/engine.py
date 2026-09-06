@@ -1740,7 +1740,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         )
 
     # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    # SGLANG_MP_START_METHOD (experiment): spawn (default) | fork | forkserver.
+    mp.set_start_method(os.environ.get("SGLANG_MP_START_METHOD", "spawn"), force=True)
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:

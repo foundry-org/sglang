@@ -24,7 +24,23 @@ def _is_overlay_diffusion_model(model_path: str) -> bool:
     return has_diffusion_overlay_registry_match(model_path, _load_overlay_registry())
 
 
+def _diffusion_deps_available() -> bool:
+    """Cheap probe before importing sglang.multimodal_gen.
+
+    Importing the registry executes most of the multimodal_gen package (~2 s)
+    before it can fail on a missing optional dependency; probing the specs of
+    the optional deps first keeps that off the LLM startup path.
+    """
+    import importlib.util
+
+    return all(
+        importlib.util.find_spec(name) is not None for name in ("imageio", "diffusers")
+    )
+
+
 def _is_diffusion_model_from_registry(model_path: str) -> bool:
+    if not _diffusion_deps_available():
+        return False
     try:
         from sglang.multimodal_gen.registry import is_registered_diffusion_model_path
     except ImportError:

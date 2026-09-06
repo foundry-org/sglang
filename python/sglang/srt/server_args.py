@@ -43,7 +43,6 @@ import tempfile
 import uuid
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
-from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import NS, A, Arg, add_cli_args_from_dataclass
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
@@ -60,7 +59,6 @@ from sglang.srt.arg_groups.overrides import (
     resolving_view,
 )
 from sglang.srt.environ import envs
-from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -84,6 +82,16 @@ from sglang.srt.utils.common import (
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 
 logger = logging.getLogger(__name__)
+
+
+def _real_kv_hash_modes():
+    # Lazy: importing sglang.kernels.ops.kv_canary.consts initializes the whole
+    # sglang.kernels package (fused_op, utils.common, torch...) at server_args
+    # import time (~2 s in processes that would not otherwise need it).
+    from sglang.kernels.ops.kv_canary.consts import RealKvHashMode
+
+    return list(RealKvHashMode)
+
 
 # --------------------------------------------------------------------------
 # Extension points: out-of-tree platforms and plugins extend these lists
@@ -3812,6 +3820,10 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
+        # Lazy: pulls the OpenAI protocol models, xgrammar and every tool-call
+        # detector (~1 s) into every process that imports server_args.
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
             "--tool-call-parser",
@@ -3826,7 +3838,7 @@ class ServerArgs:
             "--kv-canary-real-data",
             type=str,
             default=ServerArgs.kv_canary_real_data,
-            choices=[m.name.lower() for m in RealKvHashMode],
+            choices=[m.name.lower() for m in _real_kv_hash_modes()],
             help=(
                 "Check the real KV-cache in the canary. "
                 "'none' (default) disables the feature. "

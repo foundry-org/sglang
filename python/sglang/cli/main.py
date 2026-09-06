@@ -35,6 +35,9 @@ def main():
     args, extra_argv = parser.parse_known_args()
 
     if args.subcommand == "serve":
+        from sglang.srt.utils.early_forkserver import start_early
+
+        start_early()  # no-op unless SGLANG_EARLY_FORKSERVER=1
         from sglang.cli.serve import serve
 
         serve(args, extra_argv)
