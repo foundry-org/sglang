@@ -149,9 +149,15 @@ def _update_expert_weights_raw(
         routed_experts_weights_of_layer[update_layer_ids[0]]
     )
 
-    world_size = torch.distributed.get_world_size()
+    # Topology in launch-time terms: the physical-expert map spans every rank's
+    # slots, and under elastic EP torch's world size shrinks to the active ranks
+    # (2 survivors of 8 on 4 nodes gave num_gpu_per_node = 0 and a
+    # ZeroDivisionError in the fault-time rebalance).
+    world_size = max(
+        torch.distributed.get_world_size(), old_expert_location_metadata.ep_size
+    )
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
-    num_gpu_per_node = world_size // nnodes
+    num_gpu_per_node = max(1, world_size // nnodes)
 
     missing_logical_experts_by_layers: Dict[int, List[int]] = {}
 

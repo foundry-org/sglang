@@ -492,6 +492,10 @@ def maybe_recover_ep_ranks(
     # Mooncake's internal semantics guarantee that all ranks observe
     # consistent peer readiness state, so collective operations below
     # are safe even though polling appears local.
+    # NOTE: partial recovery (recovering the ranks that are back while others
+    # stay down) is not possible today: mooncake's EPBuffer.update_ep_member()
+    # gathers over the full group and fails with "Tensor list size must match
+    # active group size" on both the joiner and the survivors (tried 2026-09-07).
     if ranks_to_recover and try_recover_ranks(ranks_to_recover):
         eplb_manager.reset_generator()
         broadcast_global_expert_location_metadata(
