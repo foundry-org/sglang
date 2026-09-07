@@ -23,6 +23,9 @@ PRELOAD = [
 ]
 
 _ENV_ATTR = "_sglang_env_snapshot"
+# Environment the forkserver process started with; this module is first in the
+# preload list, so later preload imports' os.environ writes are not in here.
+_SERVER_INITIAL_ENV = dict(os.environ)
 _STDIO_ATTR = "_sglang_stdio"
 
 
@@ -68,6 +71,15 @@ def _install_process_patches():
     def run(self):
         env = getattr(self, _ENV_ATTR, None)
         if env:
+            # Launcher's environment wins. Variables that the (daemon) forkserver
+            # was *started* with but the launcher does not have are dropped (an
+            # NCCL_CUMEM_ENABLE=0 on the daemon broke DeepEP v2 in a run whose
+            # launcher did not set it); variables that worker modules set at
+            # import time inside the server (e.g. DG_JIT_CACHE_DIR) are kept,
+            # since the launcher never imports those modules.
+            for k in list(os.environ.keys()):
+                if k not in env and k in _SERVER_INITIAL_ENV:
+                    del os.environ[k]
             os.environ.update(env)
         stdio = getattr(self, _STDIO_ATTR, None)
         if stdio:

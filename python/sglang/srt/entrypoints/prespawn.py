@@ -82,6 +82,7 @@ def maybe_prespawn(server_args: ServerArgs) -> None:
         )
         return
     t1 = time.perf_counter()
+    _apply_resolution_env_side_effects(server_args)
     _set_envs_and_config(server_args)
     _maybe_setup_foundry_env(server_args)
     t2 = time.perf_counter()
@@ -108,6 +109,18 @@ def maybe_prespawn(server_args: ServerArgs) -> None:
     _PRESPAWNED = Prespawned(server_args, port_args, result, procs)
 
 
+def _apply_resolution_env_side_effects(server_args: ServerArgs) -> None:
+    """Config resolution (which pre-spawn defers) sets a few environment
+    variables that the workers must inherit and that `_set_envs_and_config`
+    would otherwise decide differently when they are absent. Mirror them here
+    from the raw record; keep in sync with `arg_groups/*_hook.py`."""
+    cfg = resolving_view(server_args)
+    # arg_groups/moe_hook.py: DeepEP v2's ElasticBuffer needs NCCL cuMem
+    # (symmetric memory); _set_envs_and_config would set it to 0 if unset.
+    if getattr(cfg, "moe_a2a_backend", None) == "deepep_v2":
+        os.environ.setdefault("NCCL_CUMEM_ENABLE", "1")
+
+
 def _maybe_setup_foundry_env(server_args: ServerArgs) -> None:
     """Foundry (CUDA graph save/load) injects its hook library via LD_PRELOAD
     from a patch on Engine._launch_scheduler_processes, installed during config
@@ -123,8 +136,9 @@ def _maybe_setup_foundry_env(server_args: ServerArgs) -> None:
     load_graph_extension_config(cfg_path)
     rt.setup_ld_preload_env()
     logger.info(
-        "[prespawn] foundry env prepared (LD_PRELOAD hook, mode=%s)",
+        "[prespawn] foundry env prepared (LD_PRELOAD hook, mode=%s, NCCL_CUMEM_ENABLE=%s)",
         os.environ.get("FOUNDRY_MODE"),
+        os.environ.get("NCCL_CUMEM_ENABLE"),
     )
 
 
