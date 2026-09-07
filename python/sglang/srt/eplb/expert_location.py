@@ -521,13 +521,28 @@ def broadcast_global_expert_location_metadata(
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group
     )
-    metadata = ExpertLocationMetadata.init_by_mapping(
+    new_metadata = ExpertLocationMetadata.init_by_mapping(
         model_config,
         metadata.physical_to_logical_map,
         moe_ep_rank=moe_ep_rank,
     )
-    set_global_expert_location_metadata(metadata, allow_overwrite=True)
-    return metadata
+    # Update the existing tensors in place instead of replacing the global
+    # object: captured CUDA graphs hold the addresses of the current
+    # physical_to_logical / logical_to_rank_dispatch maps, so a replacement
+    # leaves every decode graph routing with a stale copy. Seen as survivors
+    # producing garbage after the second fault-time EPLB rebalance (the first
+    # recovery swapped the object; the next rebalance wrote into the new one),
+    # and as a rebooted rank loading graphs captured at first launch diverging
+    # from its peers.
+    if (
+        metadata.ep_size == new_metadata.ep_size
+        and metadata.num_physical_experts == new_metadata.num_physical_experts
+        and metadata.num_layers == new_metadata.num_layers
+    ):
+        metadata.update(new_metadata, update_layer_ids=list(range(metadata.num_layers)))
+        return metadata
+    set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+    return new_metadata
 
 
 def _compute_logical_to_all_physical_map(
