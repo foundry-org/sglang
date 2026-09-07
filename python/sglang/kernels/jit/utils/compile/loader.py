@@ -30,7 +30,21 @@ if TYPE_CHECKING:
     _DISABLE_TORCH_COMPILE = lambda f: f
 else:
     # NOTE: this is not friendly to type checking
-    _DISABLE_TORCH_COMPILE = torch.compiler.disable
+    def _DISABLE_TORCH_COMPILE(fn):
+        # Lazy: reading `torch.compiler.disable` at import time pulls in
+        # torch._dynamo (~0.6 s) for every process that imports sglang kernels.
+        # Resolve it on the first call instead; the load is memoized anyway.
+        import functools
+
+        disabled = []
+
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if not disabled:
+                disabled.append(torch.compiler.disable(fn))
+            return disabled[0](*args, **kwargs)
+
+        return wrapper
 
 
 logger = logging.getLogger(__name__)

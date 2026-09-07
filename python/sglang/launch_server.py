@@ -54,6 +54,12 @@ def run_server(server_args):
         launch_server(server_args)
     else:
         # Default mode: HTTP mode.
+        # Optionally start the workers now, before the ~7 s import of the HTTP
+        # server stack below (SGLANG_PRESPAWN_WORKERS=1).
+        from sglang.srt.entrypoints.prespawn import maybe_prespawn
+
+        maybe_prespawn(server_args)
+
         from sglang.srt.entrypoints.http_server import launch_server
 
         launch_server(server_args)

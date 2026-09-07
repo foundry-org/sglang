@@ -108,8 +108,6 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
-from sglang.srt.lora.lora_drainer import LoRADrainer
-from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -2046,6 +2044,8 @@ class Scheduler(
 
     def init_lora_drainer(self) -> None:
         if get_lora().lora_drain_wait_threshold > 0.0:
+            from sglang.srt.lora.lora_drainer import LoRADrainer
+
             self.lora_drainer = LoRADrainer(
                 get_lora().max_loras_per_batch,
                 get_lora().lora_drain_wait_threshold,
@@ -2055,6 +2055,10 @@ class Scheduler(
 
     def init_lora_overlap_loader(self) -> None:
         if self.enable_lora_overlap_loading:
+            # Lazy: the LoRA loader stack costs ~0.5 s at import and is only
+            # needed when LoRA overlap loading is enabled.
+            from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+
             self.lora_overlap_loader = LoRAOverlapLoader(
                 self.tp_worker.model_runner.lora_manager
             )
