@@ -467,7 +467,7 @@ def _ensure_fastokens_patched():
     logger.info("fastokens backend enabled - transformers patched successfully")
 
 
-def get_tokenizer(
+def _get_tokenizer_uncached(
     tokenizer_name: str,
     *args,
     tokenizer_mode: str = "auto",
@@ -632,3 +632,26 @@ def _fix_added_tokens_encoding(tokenizer):
         len(broken),
         broken[:10],
     )
+
+
+# Process-local memo: the scheduler process loads the same tokenizer twice at
+# startup (Scheduler.init_tokenizer and TpModelWorker), ~0.6 s each for a
+# Qwen3 tokenizer under the transformers v5 conversion. Same arguments -> same
+# object within a process.
+_LOADED_TOKENIZERS = {}
+
+
+def get_tokenizer(tokenizer_name, *args, **kwargs):
+    key = (
+        tokenizer_name,
+        repr(args),
+        repr(sorted(kwargs.items(), key=lambda kv: kv[0])),
+    )
+    tok = _LOADED_TOKENIZERS.get(key)
+    if tok is None:
+        tok = _get_tokenizer_uncached(tokenizer_name, *args, **kwargs)
+        _LOADED_TOKENIZERS[key] = tok
+    return tok
+
+
+get_tokenizer.__doc__ = _get_tokenizer_uncached.__doc__

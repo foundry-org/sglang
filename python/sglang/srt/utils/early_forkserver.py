@@ -81,11 +81,33 @@ def _install_process_patches():
                 pass
         _restore_torch_cuda()
         _reuse_forkserver()
+        _sync_offline_flags()
         return orig_run(self)
 
     mpp.BaseProcess.start = start
     mpp.BaseProcess.run = run
     mpp.BaseProcess._sglang_env_patched = True
+
+
+def _sync_offline_flags():
+    """huggingface_hub / transformers read HF_HUB_OFFLINE into module constants
+    at import time -- in the (daemon) forkserver's environment. Re-derive them
+    from the launcher's environment that was just applied, so an offline
+    launcher does not make its workers hit the Hub (~2 s of HTTPS per worker)."""
+    import sys
+
+    val = os.environ.get("HF_HUB_OFFLINE", "")
+    offline = val.lower() in ("1", "true", "yes", "on")
+    hub = sys.modules.get("huggingface_hub.constants")
+    if hub is not None and hasattr(hub, "HF_HUB_OFFLINE"):
+        hub.HF_HUB_OFFLINE = offline
+    for name in ("transformers.utils.hub", "transformers.utils.import_utils"):
+        mod = sys.modules.get(name)
+        if mod is None:
+            continue
+        for attr in ("_is_offline_mode", "HF_HUB_OFFLINE"):
+            if hasattr(mod, attr) and isinstance(getattr(mod, attr), bool):
+                setattr(mod, attr, offline)
 
 
 def _reuse_forkserver():

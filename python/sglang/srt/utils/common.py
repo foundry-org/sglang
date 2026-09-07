@@ -2434,10 +2434,9 @@ def configure_logger(server_args, prefix: str = ""):
     for name in ("httpx", "httpcore"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
-    if is_flashinfer_available():
-        from flashinfer.jit.core import logger as flashinfer_logger
-
-        flashinfer_logger.setLevel(logging.ERROR)
+    # Set the level by name: importing flashinfer here costs ~1 s (activation ->
+    # quantization -> cute_dsl) in every process that configures logging.
+    logging.getLogger("flashinfer.jit").setLevel(logging.ERROR)
 
 
 # source: https://github.com/vllm-project/vllm/blob/93b38bea5dd03e1b140ca997dfaadef86f8f1855/vllm/lora/utils.py#L9
