@@ -83,6 +83,7 @@ def maybe_prespawn(server_args: ServerArgs) -> None:
         return
     t1 = time.perf_counter()
     _set_envs_and_config(server_args)
+    _maybe_setup_foundry_env(server_args)
     t2 = time.perf_counter()
     port_args = PortArgs.init_new(server_args)
     t3 = time.perf_counter()
@@ -105,6 +106,26 @@ def maybe_prespawn(server_args: ServerArgs) -> None:
         _since_process_start(),
     )
     _PRESPAWNED = Prespawned(server_args, port_args, result, procs)
+
+
+def _maybe_setup_foundry_env(server_args: ServerArgs) -> None:
+    """Foundry (CUDA graph save/load) injects its hook library via LD_PRELOAD
+    from a patch on Engine._launch_scheduler_processes, installed during config
+    resolution -- both of which run after this pre-spawn. Do the env part here
+    so spawned workers inherit the hook; the workers install the Python-side
+    hooks themselves (scheduler entry -> foundry_shim.apply_server_args)."""
+    cfg_path = getattr(server_args, "foundry_graph_extension_config_path", None)
+    if not cfg_path:
+        return
+    from foundry.integration.sglang import runtime as rt
+    from foundry.integration.sglang.config import load_graph_extension_config
+
+    load_graph_extension_config(cfg_path)
+    rt.setup_ld_preload_env()
+    logger.info(
+        "[prespawn] foundry env prepared (LD_PRELOAD hook, mode=%s)",
+        os.environ.get("FOUNDRY_MODE"),
+    )
 
 
 def _since_process_start() -> float:

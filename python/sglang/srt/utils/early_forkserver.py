@@ -184,6 +184,20 @@ def start_early():
     """Parent side: call once at CLI entry, before heavy imports."""
     if not enabled():
         return
+    import sys
+
+    # Foundry's CUDA hook must be LD_PRELOADed at worker exec time; forked
+    # workers inherit the (daemon) forkserver's loader state instead. Unless a
+    # daemon was started with the hook preloaded (SGLANG_FORKSERVER_ALLOW_FOUNDRY=1),
+    # fall back to spawn for foundry runs.
+    if (
+        any(a.startswith("--foundry-graph-extension-config-path") for a in sys.argv)
+        and os.environ.get("SGLANG_FORKSERVER_ALLOW_FOUNDRY") != "1"
+    ):
+        __import__("logging").getLogger(__name__).info(
+            "[early_forkserver] foundry config given; using spawn so LD_PRELOAD applies"
+        )
+        return
     import multiprocessing.forkserver as fs
 
     # The launcher-side engine code re-applies the start method from this env
@@ -293,9 +307,27 @@ def _restore_torch_cuda():
     _TORCH_CUDA_ORIG.clear()
 
 
+def _in_forkserver_process() -> bool:
+    """True inside the forkserver (spawned as `python -c 'from
+    multiprocessing.forkserver import main; ...'`) and hence in the workers it
+    forks (module state is inherited). False in the launcher, which configures
+    itself explicitly in start_early()."""
+    # The server runs as `python -c "from multiprocessing.forkserver import
+    # main; ..."`: sys.argv is just ['-c'], so read the real command line.
+    try:
+        with open("/proc/self/cmdline", "rb") as f:
+            return b"multiprocessing.forkserver" in f.read()
+    except OSError:
+        import sys
+
+        return any("multiprocessing.forkserver" in a for a in sys.argv[:3])
+
+
 # Forkserver / child side (module preloaded): make nested Process() calls (the
 # DP controller launching schedulers) reuse the same forkserver and carry env.
-if enabled():
+# Never run in the launcher: it must be able to stay on spawn (e.g. foundry
+# runs, which need LD_PRELOAD at worker exec) even with the env var set.
+if enabled() and _in_forkserver_process():
     try:
         mp.set_start_method("forkserver", force=True)
     except RuntimeError:
