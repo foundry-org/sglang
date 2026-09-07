@@ -27,6 +27,7 @@ _ENV_ATTR = "_sglang_env_snapshot"
 # preload list, so later preload imports' os.environ writes are not in here.
 _SERVER_INITIAL_ENV = dict(os.environ)
 _STDIO_ATTR = "_sglang_stdio"
+_PARENT_ATTR = "_sglang_logical_parent"
 
 
 class _FdHandle:
@@ -60,6 +61,10 @@ def _install_process_patches():
 
     def start(self):
         setattr(self, _ENV_ATTR, dict(os.environ))
+        # The OS parent of a forkserver child is the forkserver, not the
+        # process that called start(); sglang's workers signal / watch their
+        # psutil parent, so carry the logical parent along (see _adopt_parent).
+        setattr(self, _PARENT_ATTR, os.getpid())
         # Forkserver children inherit the *server's* stdio. With a shared daemon
         # that is the daemon's log, so hand the child our own stdout/stderr.
         try:
@@ -94,11 +99,64 @@ def _install_process_patches():
         _restore_torch_cuda()
         _reuse_forkserver()
         _sync_offline_flags()
+        _adopt_parent(getattr(self, _PARENT_ATTR, None))
         return orig_run(self)
 
     mpp.BaseProcess.start = start
     mpp.BaseProcess.run = run
     mpp.BaseProcess._sglang_env_patched = True
+
+
+def _adopt_parent(parent_pid):
+    """Child side. sglang's scheduler / DP controller / detokenizer do
+    ``psutil.Process().parent()`` and (a) SIGQUIT it when they crash, (b) rely
+    on it to kill_process_tree() them at shutdown. Under a forkserver the OS
+    parent is the forkserver -- or PID 1 once the forkserver is gone, and a
+    SIGQUIT to PID 1 stops a container (seen 2026-09-07). Make psutil report the
+    process that called Process.start() instead, and exit when it dies, since
+    its kill_process_tree() cannot see us among its children."""
+    if not parent_pid or parent_pid == os.getpid():
+        return
+    import signal
+    import threading
+
+    try:
+        import psutil
+    except ImportError:
+        return
+    orig_parent = psutil.Process.parent
+    me = os.getpid()
+
+    def parent(self):
+        if self.pid == me:
+            try:
+                return psutil.Process(parent_pid)
+            except psutil.NoSuchProcess:
+                pass
+        p = orig_parent(self)
+        if p is not None and p.pid == 1:
+            return None  # never signal the container's init
+        return p
+
+    psutil.Process.parent = parent
+
+    def watch():
+        while True:
+            try:
+                os.kill(parent_pid, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+            if not os.path.exists(f"/proc/{parent_pid}"):
+                break
+            with open(f"/proc/{parent_pid}/status") as st:
+                if any(l.startswith("State:") and "Z" in l for l in st):
+                    break
+            threading.Event().wait(1.0)
+        os.kill(me, signal.SIGKILL)
+
+    threading.Thread(target=watch, name="sglang-parent-watch", daemon=True).start()
 
 
 def _sync_offline_flags():
