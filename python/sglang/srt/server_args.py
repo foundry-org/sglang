@@ -65,7 +65,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     parse_cuda_graph_config_arg,
 )
-from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
     get_platform,
@@ -3810,7 +3809,9 @@ class ServerArgs:
             help="Choose the kernels for sampling layers.",
         )
 
-        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
+        from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
+
+        reasoning_parser_choices = list(REASONING_PARSER_NAMES)
         parser.add_argument(
             "--reasoning-parser",
             type=str,
@@ -3820,11 +3821,12 @@ class ServerArgs:
             f"Use 'auto' to detect from chat template. "
             f"Options include: {reasoning_parser_choices}.",
         )
-        # Lazy: pulls the OpenAI protocol models, xgrammar and every tool-call
-        # detector (~1 s) into every process that imports server_args.
-        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+        # Names only: importing function_call_parser here would pull the OpenAI
+        # protocol models, xgrammar, transformers and torch.distributed.fsdp
+        # (~3 s) into the launcher before it can spawn anything.
+        from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 
-        tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
+        tool_call_parser_choices = list(TOOL_CALL_PARSER_NAMES)
         parser.add_argument(
             "--tool-call-parser",
             type=str,

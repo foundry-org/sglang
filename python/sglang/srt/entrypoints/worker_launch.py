@@ -268,18 +268,34 @@ def _calculate_rank_ranges(
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
 
 
+class _ParallelView:
+    """Parallelism sizes read from `resolving_view(server_args)` (cheap, no
+    publish needed) so workers can be spawned before the launcher resolves and
+    publishes the config; mirrors the fields of `get_parallel()` used here."""
+
+    def __init__(self, cfg):
+        self.dp_size = cfg.dp_size
+        self.pp_size = cfg.pp_size
+        self.ep_size = cfg.ep_size
+        self.attn_cp_size = cfg.attn_cp_size
+        self.moe_dp_size = cfg.moe_dp_size
+        self.enable_dp_attention = cfg.enable_dp_attention
+        self.ep_join_mode = cfg.ep_join_mode
+
+
 def _compute_parallelism_ranks(
-    server_args: ServerArgs, tp_rank: int
+    server_args: ServerArgs, tp_rank: int, parallel=None
 ) -> Tuple[int, int, int]:
     """Compute attention-CP, MoE-DP, and MoE-EP ranks for a TP rank.
 
     Called while the launcher is deciding what to spawn, so the sizes are the
     configured ones -- the groups this is laying out do not exist yet.
     """
-    attn_dp_size = get_parallel().dp_size if get_parallel().enable_dp_attention else 1
+    par = parallel if parallel is not None else get_parallel()
+    attn_dp_size = par.dp_size if par.enable_dp_attention else 1
     tp_size = server_args.tp_size
-    attn_cp_size = get_parallel().attn_cp_size
-    moe_dp_size = get_parallel().moe_dp_size
+    attn_cp_size = par.attn_cp_size
+    moe_dp_size = par.moe_dp_size
 
     # Parallelism hierarchy (outermost to innermost):
     # - Attention: Global(TP) -> DP -> ATTN_CP -> ATTN_TP (innermost)
@@ -288,9 +304,7 @@ def _compute_parallelism_ranks(
     attn_cp_rank = (tp_rank // attn_tp_size) % attn_cp_size
     moe_dp_rank = tp_rank // (tp_size // moe_dp_size)
     moe_ep_rank = (
-        tp_rank
-        % (tp_size // moe_dp_size)
-        // (tp_size // moe_dp_size // get_parallel().ep_size)
+        tp_rank % (tp_size // moe_dp_size) // (tp_size // moe_dp_size // par.ep_size)
     )
     return attn_cp_rank, moe_dp_rank, moe_ep_rank
 
@@ -300,6 +314,7 @@ def launch_scheduler_processes(
     port_args: PortArgs,
     run_scheduler_process_func: Callable,
     run_dp_controller_func: Callable = None,
+    parallel=None,
 ) -> Tuple[SchedulerInitResult, Optional[List]]:
     """Launch scheduler processes using multiprocessing.
     Override in subclasses for different backends (e.g. Ray).
@@ -309,9 +324,11 @@ def launch_scheduler_processes(
         scheduler_procs is None for RayEngine (uses Ray actors instead).
     """
     scheduler_procs = []
-    use_dp_controller = (
-        get_parallel().dp_size > 1 or get_exec().moe.ep_join_mode == "scale"
+    par = parallel if parallel is not None else get_parallel()
+    ep_join_mode = (
+        parallel.ep_join_mode if parallel is not None else get_exec().moe.ep_join_mode
     )
+    use_dp_controller = par.dp_size > 1 or ep_join_mode == "scale"
 
     if not use_dp_controller:
         # Launch tensor parallel scheduler processes
@@ -323,7 +340,7 @@ def launch_scheduler_processes(
         pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
             _calculate_rank_ranges(
                 server_args.nnodes,
-                get_parallel().pp_size,
+                par.pp_size,
                 server_args.tp_size,
                 server_args.node_rank,
             )
@@ -338,7 +355,7 @@ def launch_scheduler_processes(
                     + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
                 )
                 attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                    server_args, tp_rank
+                    server_args, tp_rank, parallel
                 )
 
                 with maybe_reindex_device_id(gpu_id) as gpu_id:

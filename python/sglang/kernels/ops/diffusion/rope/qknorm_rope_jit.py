@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels import compiler_lazy
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -125,7 +126,7 @@ def _can_use_fused_qknorm_rope(
         return False
 
 
-@torch.compiler.assume_constant_result
+@compiler_lazy.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm_rope(
     head_dim: int,

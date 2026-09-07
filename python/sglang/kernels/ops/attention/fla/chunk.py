@@ -7,6 +7,7 @@ from typing import Optional
 import torch
 from einops import rearrange
 
+from sglang.kernels import compiler_lazy
 from sglang.kernels.ops.attention.fla.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from sglang.kernels.ops.attention.fla.chunk_fwd import chunk_gated_delta_rule_fwd_intra
 from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
@@ -129,7 +130,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         return o.to(q.dtype), h
 
 
-@torch.compiler.disable
+@compiler_lazy.disable
 def chunk_gated_delta_rule(
     q: torch.Tensor,
     k: torch.Tensor,

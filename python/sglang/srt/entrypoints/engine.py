@@ -950,7 +950,16 @@ class Engine(EngineScoreMixin, EngineBase):
         # skip the environment/port setup it already did.
         pre = prespawn.take(server_args) if port_args is None else None
         if pre is not None and run_scheduler_process_func is run_scheduler_process:
+            # prespawn did configure_logger/_set_envs_and_config/PortArgs only.
+            server_args.resolve_once()
+            load_plugins()
+            server_args.check_server_args()
+            parsers = resolving_view(server_args)
+            if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
+                resolve_auto_parsers(server_args)
+            publish(server_args, role="tokenizer")
             port_args = pre.port_args
+            logger.info(f"server_args={server_args.resolved_dict()}")
             engine_info_bootstrap_server = None
             weight_cache_daemon_procs: List = []
             scheduler_init_result, scheduler_procs = pre.result, pre.procs

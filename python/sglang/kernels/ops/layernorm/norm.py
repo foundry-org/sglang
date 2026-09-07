@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels import compiler_lazy
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -96,7 +97,7 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
     )
 
 
-@torch.compiler.assume_constant_result
+@compiler_lazy.assume_constant_result
 @cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
     if head_dim not in [64, 128, 256, 512, 1024]:

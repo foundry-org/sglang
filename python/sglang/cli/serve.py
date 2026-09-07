@@ -92,10 +92,13 @@ def _run_llm(request: ServeRequest) -> None:
         _print_llm_help(request)
         return
 
+    from sglang.cli.main import _startup_trace
     from sglang.launch_server import run_server
     from sglang.srt.server_args import prepare_server_args
 
+    _startup_trace("_run_llm: launch_server + server_args imported")
     server_args = prepare_server_args(list(request.argv))
+    _startup_trace("_run_llm: server args prepared")
     run_server(server_args)
 
 

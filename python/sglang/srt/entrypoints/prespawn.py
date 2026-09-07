@@ -53,48 +53,71 @@ def _eligible(server_args: ServerArgs) -> bool:
 
 
 def maybe_prespawn(server_args: ServerArgs) -> None:
-    """Called from `run_server` before importing the HTTP server module."""
+    """Called from `run_server` before importing the HTTP server module.
+
+    Deliberately does *not* resolve/validate/publish the config: resolution
+    imports the model stack (~3-5 s in the launcher). The workers resolve on
+    their own (`publish()` in the child does), and `_launch_subprocesses`
+    performs the launcher-side resolution, validation and publish when it adopts
+    the pre-spawned processes.
+    """
     global _PRESPAWNED
     if not enabled() or _PRESPAWNED is not None:
         return
+    import time
+
     from sglang.srt.entrypoints.worker_launch import (
+        _ParallelView,
         _set_envs_and_config,
         launch_scheduler_processes,
     )
     from sglang.srt.managers import process_entry
-    from sglang.srt.plugins import load_plugins
-    from sglang.srt.runtime_context import publish
     from sglang.srt.utils import configure_logger
 
+    t0 = time.perf_counter()
     configure_logger(server_args)
-    server_args.resolve_once()
     if not _eligible(server_args):
         logger.info(
             "[prespawn] configuration not eligible; using the normal launch path"
         )
         return
+    t1 = time.perf_counter()
     _set_envs_and_config(server_args)
-    load_plugins()
-    server_args.check_server_args()
-    parsers = resolving_view(server_args)
-    if parsers.reasoning_parser == "auto" or parsers.tool_call_parser == "auto":
-        from sglang.srt.parser.template_detection import resolve_auto_parsers
-
-        resolve_auto_parsers(server_args)
-    publish(server_args, role="tokenizer")
+    t2 = time.perf_counter()
     port_args = PortArgs.init_new(server_args)
-    logger.info(f"server_args={server_args.resolved_dict()}")
+    t3 = time.perf_counter()
     result, procs = launch_scheduler_processes(
         server_args,
         port_args,
         process_entry.run_scheduler_process,
         process_entry.run_data_parallel_controller_process,
+        parallel=_ParallelView(resolving_view(server_args)),
     )
+    t4 = time.perf_counter()
     logger.info(
-        "[prespawn] started %d worker process(es) before the server imports",
+        "[prespawn] started %d worker process(es) before the server imports "
+        "(logger %.2fs, envs %.2fs, ports %.2fs, spawn %.2fs; %.1fs since interpreter start)",
         len(procs or []),
+        t1 - t0,
+        t2 - t1,
+        t3 - t2,
+        t4 - t3,
+        _since_process_start(),
     )
     _PRESPAWNED = Prespawned(server_args, port_args, result, procs)
+
+
+def _since_process_start() -> float:
+    """Seconds since this process was created (Linux /proc)."""
+    try:
+
+        with open("/proc/self/stat") as f:
+            start_ticks = int(f.read().split(")")[-1].split()[19])
+        with open("/proc/uptime") as f:
+            uptime = float(f.read().split()[0])
+        return uptime - start_ticks / os.sysconf("SC_CLK_TCK")
+    except Exception:
+        return -1.0
 
 
 def take(server_args: ServerArgs) -> Optional[Prespawned]:
