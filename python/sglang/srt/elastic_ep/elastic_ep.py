@@ -429,10 +429,55 @@ def join_scale_process_group() -> None:
     _refresh_ep_members()
 
 
+def ensure_mooncake_ep_buffer(model) -> bool:
+    """Create the mooncake EP buffer if the model has not dispatched yet.
+
+    sglang creates it lazily on the first MoE dispatch. A rebooting rank with
+    CUDA graphs has done that during capture (and foundry bootstraps it before
+    LOAD), but an eager rank reaches join_process_groups() without a buffer, so
+    _refresh_ep_members() is a no-op there while the survivors run
+    update_ep_member()'s all_gather; the survivors' collective then pairs with
+    the joiner's next one and both sides hang. Returns True if a buffer exists."""
+    from sglang.srt.layers.moe.token_dispatcher.mooncake import (
+        EPBuffer,
+        MooncakeEPDispatcher,
+    )
+
+    if EPBuffer.get_existing_buffer() is not None:
+        return True
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        candidates = [dispatcher, *getattr(dispatcher, "_inners", [])]
+        mk = next((d for d in candidates if isinstance(d, MooncakeEPDispatcher)), None)
+        if mk is None:
+            continue
+        impl = getattr(mk, "_low_latency_dispatcher", None)
+        if impl is None:
+            continue
+        impl._get_buffer()
+        logger.info("[Elastic EP] created the mooncake EP buffer before joining")
+        return True
+    return False
+
+
 def join_process_groups() -> None:
     """Rejoin WORLD and every launch-time parallel group after recovery."""
     from mooncake.pg import join_group
 
+    # Mooncake activates our join_group() only when the survivors call
+    # recover_ranks() for us, and a recover issued before we are inside
+    # join_group() is lost (both sides then hang: survivors in the member-update
+    # all_gather, we in join_group). Announce ourselves right before joining;
+    # the survivors wait until this marker is a couple of seconds old.
+    marker_dir = os.environ.get("SGLANG_ELASTIC_JOIN_MARKER_DIR")
+    if marker_dir:
+        os.makedirs(marker_dir, exist_ok=True)
+        with open(
+            os.path.join(marker_dir, f"rank_{torch.distributed.get_rank()}"), "w"
+        ) as f:
+            f.write(str(os.getpid()))
     _join_world_group()
     for group in _iter_live_parallel_groups():
         if group.world_size <= 1:
@@ -497,7 +542,27 @@ def maybe_recover_ep_ranks(
     # stay down) is not possible today: mooncake's EPBuffer.update_ep_member()
     # gathers over the full group and fails with "Tensor list size must match
     # active group size" on both the joiner and the survivors (tried 2026-09-07).
+    marker_dir = os.environ.get("SGLANG_ELASTIC_JOIN_MARKER_DIR")
+    if ranks_to_recover and marker_dir:
+        # get_peer_state() is true as soon as a rebooting rank has registered
+        # with the coordinator (its process-group init), long before it calls
+        # join_group(). Recovering then hangs in EPBuffer.update_ep_member()'s
+        # all_gather, which the joiner only answers from join_process_groups().
+        # The joiner drops a marker right before joining (same host).
+        paths = [os.path.join(marker_dir, f"rank_{r}") for r in ranks_to_recover]
+        if not all(os.path.exists(p) for p in paths):
+            return False
+        # The marker precedes the joiner's join_group() call by microseconds;
+        # give it time to be inside the join before recovering it.
+        if any(time.time() - os.path.getmtime(p) < 2.0 for p in paths):
+            return False
     if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+        if marker_dir:
+            for r in ranks_to_recover:
+                try:
+                    os.remove(os.path.join(marker_dir, f"rank_{r}"))
+                except OSError:
+                    pass
         eplb_manager.reset_generator()
         broadcast_global_expert_location_metadata(
             model_config=model_config,
@@ -540,35 +605,62 @@ def _wait_for_dead_ranks_deactivated(
     )
 
 
-def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+def _wait_for_pg_deactivation(
+    tp_group, dead: List[int], timeout_s: float = 90.0
+) -> None:
+    """The a2a side (ElasticEPState.active_ranks) learns of a dead peer from a
+    failed transfer; the process-group side (GroupCoordinator.active_ranks, the
+    tensors handed to mooncake's backend) only when the coordinator's heartbeat
+    timeout deactivates the rank. Collectives issued in between fail with "rank
+    is not active in this group". Wait for the pg-side view to agree."""
+    if tp_group is None or not dead:
+        return
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        dev = tp_group.active_ranks.detach().cpu().tolist()
+        cpu = tp_group.active_ranks_cpu.tolist()
+        if all(not dev[r] and not cpu[r] for r in dead if r < len(dev)):
+            return
+        time.sleep(0.1)
+    logger.warning(
+        "[Elastic EP] process groups still list %s as active after %.0f s; rebalancing anyway",
+        dead,
+        timeout_s,
+    )
+
+
+def maybe_rebalance_after_rank_fault(
+    *, eplb_manager: EPLBManager, tp_group=None
+) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
+    # Ranks that just went active -> inactive (a fault), as opposed to ranks
+    # coming back after recovery (also a change, but no delay wanted there).
+    dead_mask = (elastic_ep_state.last_active_ranks != 0) & (
+        elastic_ep_state.active_ranks == 0
+    )
+    dead_ranks = [i for i, d in enumerate(dead_mask.tolist()) if d]
+    newly_dead = bool(dead_ranks)
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
-    # The a2a kernels mark a peer inactive as soon as a transfer to it fails,
-    # typically ~20 s before the mooncake coordinator's heartbeat timeout
-    # deactivates it in the process groups. Rebalancing in that window ran
-    # collectives against a group whose view still had the dead ranks
-    # ("mooncakePgBroadcast failed: rank is not active in this group", the
-    # survivors died). Wait until the coordinator agrees; graph-replay engines
-    # never hit this because they only notice the fault after the timeout.
-    # NOTE: waiting here for mooncake's get_peer_state() to report the dead
-    # ranks as gone does not work: it kept reporting them (2026-09-08), so the
-    # wait only stalled the survivors' forward loop for its full timeout. The
-    # eager-mode race (rebalance before the coordinator's deactivation, see
-    # _wait_for_dead_ranks_deactivated) is still open.
-    if os.environ.get("SGLANG_ELASTIC_WAIT_COORDINATOR") == "1":
-        _wait_for_dead_ranks_deactivated(elastic_ep_state)
-    # Eager (no CUDA graph) engines notice a dead peer from the failed a2a
-    # transfer ~20 s before the coordinator's heartbeat timeout; rebalancing in
-    # that window crashed the survivors. Graph engines only notice after the
-    # timeout. This knob delays the rebalance by a fixed time so the eager path
-    # follows the same timeline (demo baseline; default off).
-    delay = float(os.environ.get("SGLANG_ELASTIC_FAULT_REBALANCE_DELAY_S", "0") or 0)
-    if delay > 0:
-        logger.info("[Elastic EP] rank fault detected; rebalance in %.0f s", delay)
-        time.sleep(delay)
+    if newly_dead:
+        _wait_for_pg_deactivation(tp_group, dead_ranks)
+        if os.environ.get("SGLANG_ELASTIC_WAIT_COORDINATOR") == "1":
+            _wait_for_dead_ranks_deactivated(elastic_ep_state)
+        # The a2a kernels mark a peer inactive as soon as a transfer to it
+        # fails, ~20 s before the mooncake coordinator's heartbeat timeout
+        # deactivates it in the process groups; rebalancing in that window ran
+        # collectives against a group whose view still had the dead ranks
+        # ("mooncakePg* failed: rank is not active in this group", survivors
+        # died). Seen on the eager path and, under heavy load, with graphs.
+        # This knob delays the fault-time rebalance past the timeout.
+        delay = float(
+            os.environ.get("SGLANG_ELASTIC_FAULT_REBALANCE_DELAY_S", "0") or 0
+        )
+        if delay > 0:
+            logger.info("[Elastic EP] rank fault detected; rebalance in %.0f s", delay)
+            time.sleep(delay)
     logger.info("EPLB due to rank faults")
     gen = eplb_manager.rebalance()
     while True:
@@ -576,4 +668,14 @@ def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
             next(gen)
         except StopIteration:
             break
+    marker_dir = os.environ.get("SGLANG_ELASTIC_JOIN_MARKER_DIR")
+    if newly_dead and marker_dir:
+        # Rebooting ranks hold their process-group init on this file: a rank
+        # that registers with the coordinator while the survivors are inside
+        # this rebalance becomes a P2P target of the expert moves before it
+        # can answer them, and both sides hang (seen when the eager joiner's
+        # ~18 s pg init ended at the same second the rebalance began).
+        os.makedirs(marker_dir, exist_ok=True)
+        with open(os.path.join(marker_dir, "survivors_rebalanced"), "w") as f:
+            f.write(str(time.time()))
     return True

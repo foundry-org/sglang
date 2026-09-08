@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -423,6 +424,22 @@ class ModelRunner:
 
         # Get available memory before model loading.
         # Stored for later use by alloc_memory_pool().
+        import os as _os  # `os` is rebound later in this method by a local import
+
+        marker_dir = _os.environ.get("SGLANG_ELASTIC_JOIN_MARKER_DIR")
+        if marker_dir and is_ep_joiner() and not is_ep_scale_joiner():
+            # See maybe_rebalance_after_rank_fault: do not register with the
+            # mooncake coordinator while the survivors may still be inside
+            # their fault-time rebalance.
+            marker = _os.path.join(marker_dir, "survivors_rebalanced")
+            t0 = time.perf_counter()
+            while not _os.path.exists(marker) and time.perf_counter() - t0 < 180:
+                time.sleep(0.2)
+            logger.info(
+                "[Elastic EP] survivors' fault rebalance %s after %.1f s; initializing process groups",
+                "seen" if _os.path.exists(marker) else "NOT seen (timeout)",
+                time.perf_counter() - t0,
+            )
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
@@ -971,6 +988,18 @@ class ModelRunner:
                 )
 
     def post_capture_elastic_ep_recover(self):
+        # A join that lands while the survivors are still inside their
+        # fault-time EPLB rebalance deadlocked both sides (eager engines are
+        # ready ~50 s after the fault, right when that rebalance ends); graph
+        # engines join later by construction. Optional hold-off for the demo.
+        join_delay = float(os.environ.get("SGLANG_ELASTIC_JOIN_DELAY_S", "0") or 0)
+        if join_delay > 0:
+            logger.info("[Elastic EP] holding join for %.0f s", join_delay)
+            time.sleep(join_delay)
+        if get_exec().moe.moe_a2a_backend == "mooncake":
+            from sglang.srt.elastic_ep.elastic_ep import ensure_mooncake_ep_buffer
+
+            ensure_mooncake_ep_buffer(self.model)
         join_process_groups()
 
         global_ep_rank = self.ps.tp_rank + get_parallel().ep_join_rank_offset
@@ -2169,7 +2198,9 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
-        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
+        if maybe_rebalance_after_rank_fault(
+            eplb_manager=self.eplb_manager, tp_group=self.tp_group
+        ):
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,
