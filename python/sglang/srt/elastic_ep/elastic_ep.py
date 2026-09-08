@@ -605,6 +605,47 @@ def _wait_for_dead_ranks_deactivated(
     )
 
 
+def _deactivate_dead_ranks(dead: List[int]) -> None:
+    """Tell the mooncake coordinator that these ranks are gone as soon as the
+    a2a side has seen them fail, instead of waiting for its heartbeat timeout
+    (~30 s). Proposal responses are logged, not enforced: the pg-side wait that
+    follows is still the authority."""
+    from mooncake.pg import deactivate_ranks
+
+    t0 = time.perf_counter()
+    only_world = os.environ.get("SGLANG_ELASTIC_PROACTIVE_DEACTIVATE") == "world"
+    try:
+        t = time.perf_counter()
+        r = deactivate_ranks(torch.distributed.group.WORLD, dead)
+        logger.info(
+            "[Elastic EP] deactivate_ranks(WORLD, %s) -> %s in %.2f s",
+            dead,
+            r,
+            time.perf_counter() - t,
+        )
+        if not only_world:
+            for group in _iter_live_parallel_groups():
+                local = _map_global_to_group_local_ranks(group.ranks, dead)
+                if not local or group.world_size <= 1:
+                    continue
+                t = time.perf_counter()
+                deactivate_ranks(group.device_group, local)
+                deactivate_ranks(group.cpu_group, local)
+                logger.info(
+                    "[Elastic EP] deactivate_ranks(%s, %s) in %.2f s",
+                    group.unique_name,
+                    local,
+                    time.perf_counter() - t,
+                )
+    except Exception as e:  # coordinator may already have done it
+        logger.info("[Elastic EP] proactive deactivate_ranks(%s): %s", dead, e)
+    logger.info(
+        "[Elastic EP] proactive deactivation of %s took %.2f s",
+        dead,
+        time.perf_counter() - t0,
+    )
+
+
 def _wait_for_pg_deactivation(
     tp_group, dead: List[int], timeout_s: float = 90.0
 ) -> None:
@@ -616,10 +657,16 @@ def _wait_for_pg_deactivation(
     if tp_group is None or not dead:
         return
     deadline = time.perf_counter() + timeout_s
+    t0 = time.perf_counter()
     while time.perf_counter() < deadline:
         dev = tp_group.active_ranks.detach().cpu().tolist()
         cpu = tp_group.active_ranks_cpu.tolist()
         if all(not dev[r] and not cpu[r] for r in dead if r < len(dev)):
+            logger.info(
+                "[Elastic EP] process groups list %s inactive after %.2f s",
+                dead,
+                time.perf_counter() - t0,
+            )
             return
         time.sleep(0.1)
     logger.warning(
@@ -645,6 +692,8 @@ def maybe_rebalance_after_rank_fault(
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
     if newly_dead:
+        if os.environ.get("SGLANG_ELASTIC_PROACTIVE_DEACTIVATE") in ("1", "world"):
+            _deactivate_dead_ranks(dead_ranks)
         _wait_for_pg_deactivation(tp_group, dead_ranks)
         if os.environ.get("SGLANG_ELASTIC_WAIT_COORDINATOR") == "1":
             _wait_for_dead_ranks_deactivated(elastic_ep_state)

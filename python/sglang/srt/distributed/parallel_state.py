@@ -339,6 +339,7 @@ class GroupCoordinator:
             if "mooncake" in torch_distributed_backend:
                 from mooncake.pg import MooncakeBackendOptions
 
+                _apply_mooncake_pg_env_knobs()
                 pg_active_size = len(ranks)
                 if not recovered_rank and max_world_size is not None:
                     assert max_world_size >= len(ranks), (
@@ -2114,6 +2115,40 @@ def graph_capture(stream=None):
 
 
 logger = logging.getLogger(__name__)
+
+
+_MOONCAKE_PG_KNOBS_APPLIED = False
+
+
+def _apply_mooncake_pg_env_knobs() -> None:
+    """Process-wide mooncake process-group timeouts (defaults are tens of
+    seconds and gate how fast a rank fault is seen): the coordinator's fault
+    reconciliation window, the peer-liveness probe timeout of collectives and
+    the P2P transfer timeout, all in microseconds. Applied once per process,
+    before the first mooncake backend is created."""
+    global _MOONCAKE_PG_KNOBS_APPLIED
+    if _MOONCAKE_PG_KNOBS_APPLIED:
+        return
+    _MOONCAKE_PG_KNOBS_APPLIED = True
+    import os
+
+    import mooncake.pg as mpg
+
+    for env, setter in (
+        ("SGLANG_MOONCAKE_PG_FAULT_WINDOW_US", "set_fault_reconciliation_window_us"),
+        ("SGLANG_MOONCAKE_PG_COLLECTIVE_TIMEOUT_US", "set_collective_timeout_us"),
+        ("SGLANG_MOONCAKE_PG_P2P_TIMEOUT_US", "set_p2p_timeout_us"),
+    ):
+        val = os.environ.get(env)
+        if not val:
+            continue
+        fn = getattr(mpg, setter, None)
+        if fn is None:
+            logger.warning("mooncake.pg has no %s; ignoring %s", setter, env)
+            continue
+        fn(int(val))
+        logger.info("mooncake pg: %s(%s)", setter, val)
+
 
 _ENABLE_CUSTOM_ALL_REDUCE = True
 _ENABLE_MSCCLPP_ALL_REDUCE = False
