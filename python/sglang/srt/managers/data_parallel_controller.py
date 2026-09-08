@@ -777,10 +777,19 @@ class DataParallelController:
                 or rank not in self._active_workers
                 or self.workers[rank] is None
             ):
-                raise ValueError(f"DP rank {rank} is not active.")
+                # A bad routed_dp_rank must not take the controller down (it
+                # did, under elastic EP with the rank still inactive); fall back
+                # to the normal scheduler for this request.
+                logger.warning(
+                    f"DP rank {rank} is not active; routing request normally."
+                )
+                return False
             logger.debug(f"Direct routing to DP rank {rank}")
             if not self._send_to_worker(rank, req):
-                raise ValueError(f"DP rank {rank} is unreachable.")
+                logger.warning(
+                    f"DP rank {rank} is unreachable; routing request normally."
+                )
+                return False
             return True
         return False
 

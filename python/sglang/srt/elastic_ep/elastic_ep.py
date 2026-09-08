@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
@@ -512,12 +513,62 @@ def maybe_recover_ep_ranks(
     return False
 
 
+def _wait_for_dead_ranks_deactivated(
+    elastic_ep_state, timeout_s: float = 120.0
+) -> None:
+    from mooncake.pg import get_peer_state
+
+    dead = [
+        i for i, ok in enumerate(elastic_ep_state.active_ranks_cpu.tolist()) if not ok
+    ]
+    if not dead:
+        return
+    world = torch.distributed.group.WORLD
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        try:
+            if not any(get_peer_state(world, dead)):
+                return
+        except Exception as e:  # pg already knows they are gone
+            logger.debug("[Elastic EP] get_peer_state(%s): %s", dead, e)
+            return
+        time.sleep(0.2)
+    logger.warning(
+        "[Elastic EP] coordinator still lists dead ranks %s as active after %.0f s; rebalancing anyway",
+        dead,
+        timeout_s,
+    )
+
+
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
+    # The a2a kernels mark a peer inactive as soon as a transfer to it fails,
+    # typically ~20 s before the mooncake coordinator's heartbeat timeout
+    # deactivates it in the process groups. Rebalancing in that window ran
+    # collectives against a group whose view still had the dead ranks
+    # ("mooncakePgBroadcast failed: rank is not active in this group", the
+    # survivors died). Wait until the coordinator agrees; graph-replay engines
+    # never hit this because they only notice the fault after the timeout.
+    # NOTE: waiting here for mooncake's get_peer_state() to report the dead
+    # ranks as gone does not work: it kept reporting them (2026-09-08), so the
+    # wait only stalled the survivors' forward loop for its full timeout. The
+    # eager-mode race (rebalance before the coordinator's deactivation, see
+    # _wait_for_dead_ranks_deactivated) is still open.
+    if os.environ.get("SGLANG_ELASTIC_WAIT_COORDINATOR") == "1":
+        _wait_for_dead_ranks_deactivated(elastic_ep_state)
+    # Eager (no CUDA graph) engines notice a dead peer from the failed a2a
+    # transfer ~20 s before the coordinator's heartbeat timeout; rebalancing in
+    # that window crashed the survivors. Graph engines only notice after the
+    # timeout. This knob delays the rebalance by a fixed time so the eager path
+    # follows the same timeline (demo baseline; default off).
+    delay = float(os.environ.get("SGLANG_ELASTIC_FAULT_REBALANCE_DELAY_S", "0") or 0)
+    if delay > 0:
+        logger.info("[Elastic EP] rank fault detected; rebalance in %.0f s", delay)
+        time.sleep(delay)
     logger.info("EPLB due to rank faults")
     gen = eplb_manager.rebalance()
     while True:

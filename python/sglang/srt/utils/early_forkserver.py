@@ -374,7 +374,9 @@ def _restore_torch_cuda():
 
     for name, fn in _TORCH_CUDA_ORIG.items():
         setattr(torch.cuda, name, fn)
-    _TORCH_CUDA_ORIG.clear()
+    # Keep the originals: code that bound the shim at import (torch._dynamo's
+    # CudaInterface -> inductor's DeviceProperties.create) still calls it in
+    # the child, and it must keep delegating instead of raising KeyError.
 
 
 def _in_forkserver_process() -> bool:
