@@ -514,6 +514,10 @@ class ExecGraph(msgspec.Struct):
         bool,
         "Enable profiling of cuda graph capture.",
     ] = False
+    foundry_graph_extension_config_path: A[
+        Optional[str],
+        "Path to the Foundry CUDA graph extension TOML config (out-of-tree graph persistence).",
+    ] = None
     enable_cudagraph_gc: A[
         bool,
         "Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",

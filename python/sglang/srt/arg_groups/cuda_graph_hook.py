@@ -480,6 +480,29 @@ def apply_deepep_adjustments(server_args: Any):
             )
 
 
+def handle_graph_extension(server_args: Any):
+    """Out-of-tree CUDA-graph persistence (Foundry) pins the graph-related
+    fields; must run before handle_cuda_graph_config so resolution sees them."""
+
+    cfg = resolving_view(server_args)
+    if not cfg.foundry_graph_extension_config_path:
+        return
+    # Foundry persists full decode graphs only: prefill capture (BCG is the
+    # CUDA default) is not covered by its archive format, and autotune /
+    # profiling must stay off so SAVE and LOAD take identical allocation paths.
+    declare_resolution(
+        server_args,
+        "_handle_graph_extension",
+        cuda_graph_backend_decode="full",
+        cuda_graph_backend_prefill="disabled",
+        enable_profile_cuda_graph=False,
+        disable_flashinfer_autotune=True,
+    )
+    from sglang.srt.foundry_shim import apply_server_args
+
+    apply_server_args(server_args)
+
+
 def apply_inkling_prefill_cuda_graph_default(server_args: Any):
     """Inkling opts into full-graph prefill CUDA-graph capture. Must run
     before _handle_cuda_graph_config: the generic breakable default is
