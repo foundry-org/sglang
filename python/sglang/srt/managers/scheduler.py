@@ -6041,6 +6041,11 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Foundry mutates server_args; must run before publish() projects the bags.
+    if server_args.foundry_graph_extension_config_path:
+        from sglang.srt.foundry_shim import apply_server_args
+
+        apply_server_args(server_args)
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.
