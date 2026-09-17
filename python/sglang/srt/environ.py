@@ -305,6 +305,9 @@ class Envs:
     # Vendor name. torch compares it to the string "1", so it is not an EnvBool;
     # start_early() sets it so torch.cuda.is_available() does not spoil fork().
     PYTORCH_NVML_BASED_CUDA_CHECK = EnvStr(None)
+    # Spawn the scheduler or DP-controller processes right after argument
+    # parsing, before the launcher imports the HTTP and tokenizer stack.
+    SGLANG_PRESPAWN_WORKERS = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
@@ -1100,6 +1103,9 @@ class Envs:
     # FlashInfer, FlashMLA, and TRT-LLM
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
+    # Vendor name, read by flashinfer's jit/core.py and artifacts.py when they
+    # are imported; configure_logger() sets it to quiet the JIT logger.
+    FLASHINFER_LOGGING_LEVEL = EnvStr("info")
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
