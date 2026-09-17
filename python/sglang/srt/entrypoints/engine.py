@@ -1762,8 +1762,17 @@ def _set_envs_and_config(server_args: ServerArgs):
             "the process tree when a child process fails."
         )
 
-    # Set mp start method
-    mp.set_start_method("spawn", force=True)
+    # Set mp start method (forkserver when start_early() prepared one).
+    start_method = envs.SGLANG_MP_START_METHOD.get()
+    if start_method == "forkserver" and cfg.enable_memory_saver:
+        # torch_memory_saver is LD_PRELOADed into a freshly exec'd worker; a
+        # fork() of the preloaded forkserver cannot pick it up.
+        logger.warning(
+            "--enable-memory-saver needs spawned workers; SGLANG_EARLY_FORKSERVER "
+            "is ignored for this launch"
+        )
+        start_method = "spawn"
+    mp.set_start_method(start_method, force=True)
 
     # Set gc threshold
     if gc_threshold := cfg.gc_threshold:

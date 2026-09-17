@@ -286,6 +286,21 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
 
     # ===================================================================
+    # Worker process startup
+    # ===================================================================
+    # Start the multiprocessing forkserver at CLI entry with the worker modules
+    # preloaded, so workers fork from an imported server instead of re-importing
+    # sglang/torch under `spawn` (entrypoints/early_forkserver.py).
+    SGLANG_EARLY_FORKSERVER = EnvBool(False)
+    # multiprocessing start method the launcher applies: spawn | forkserver.
+    # Set by start_early(); not meant to be set by hand.
+    SGLANG_MP_START_METHOD = EnvStr("spawn")
+    # Address and pid of the forkserver the launcher started, so nested
+    # Process() calls reuse it. Set by start_early(); not meant to be set by hand.
+    SGLANG_FORKSERVER_ADDRESS = EnvStr(None)
+    SGLANG_FORKSERVER_PID = EnvInt(None)
+
+    # ===================================================================
     # Model configuration, discovery, and weight loading
     # ===================================================================
     SGLANG_USE_MODELSCOPE = EnvBool(False)
