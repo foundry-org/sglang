@@ -40,7 +40,6 @@ if ENABLE_JIT_DEEPGEMM:
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
-_ENABLE_JIT_DEEPGEMM_PRECOMPILE = envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
 _DO_COMPILE_ALL = True
 _IS_FIRST_RANK_ON_NODE = envs.SGLANG_IS_FIRST_RANK_ON_NODE.get()
 _IN_PRECOMPILE_STAGE = envs.SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE.get()
@@ -157,8 +156,10 @@ def _maybe_compile_deep_gemm_one_type_all(
     global _BUILTIN_M_LIST
 
     query_key = (kernel_type, n, k, num_groups)
+    # Read at call time: the module may have been imported by a forkserver
+    # whose environment did not carry the launcher's setting.
     if (
-        _ENABLE_JIT_DEEPGEMM_PRECOMPILE
+        envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.get()
         and _DO_COMPILE_ALL
         and _INITIALIZATION_DICT.get(query_key) is None
     ):

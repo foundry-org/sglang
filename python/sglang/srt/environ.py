@@ -290,6 +290,23 @@ class Envs:
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)
 
     # ===================================================================
+    # Worker process startup
+    # ===================================================================
+    # Start the forkserver at CLI entry with the worker modules preloaded, so a
+    # worker forks from an imported server instead of re-importing under spawn.
+    SGLANG_EARLY_FORKSERVER = EnvBool(False)
+    # multiprocessing start method the launcher applies: spawn | forkserver.
+    # Set by start_early(); not meant to be set by hand.
+    SGLANG_MP_START_METHOD = EnvStr("spawn")
+    # Address and pid of the forkserver the launcher started, so nested
+    # Process() calls reuse it. Set by start_early(); not meant to be set by hand.
+    SGLANG_FORKSERVER_ADDRESS = EnvStr(None)
+    SGLANG_FORKSERVER_PID = EnvInt(None)
+    # Vendor name. torch compares it to the string "1", so it is not an EnvBool;
+    # start_early() sets it so torch.cuda.is_available() does not spoil fork().
+    PYTORCH_NVML_BASED_CUDA_CHECK = EnvStr(None)
+
+    # ===================================================================
     # Model configuration, discovery, and weight loading
     # ===================================================================
     SGLANG_USE_MODELSCOPE = EnvBool(False)
