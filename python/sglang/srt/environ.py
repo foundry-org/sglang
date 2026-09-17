@@ -295,6 +295,9 @@ class Envs:
     # Start the forkserver at CLI entry with the worker modules preloaded, so a
     # worker forks from an imported server instead of re-importing under spawn.
     SGLANG_EARLY_FORKSERVER = EnvBool(False)
+    # Address file of a long-lived forkserver daemon; a launcher with
+    # SGLANG_EARLY_FORKSERVER=1 attaches when the file names a live one.
+    SGLANG_FORKSERVER_FILE = EnvStr("/tmp/sglang_forkserver.json")
     # multiprocessing start method the launcher applies: spawn | forkserver.
     # Set by start_early(); not meant to be set by hand.
     SGLANG_MP_START_METHOD = EnvStr("spawn")

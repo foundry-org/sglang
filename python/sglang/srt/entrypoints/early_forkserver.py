@@ -7,6 +7,12 @@ start, and the DP controller pays it again for the schedulers it spawns. With
 a forkserver whose preload list already holds those modules, a worker is a
 ``fork()`` of the server and starts in well under a second.
 
+``start_early()`` is called from the CLI entry before the launcher's own heavy
+imports, so the server's import overlaps the launcher's. ``python -m
+sglang.srt.entrypoints.early_forkserver`` runs a *daemon* forkserver that
+outlives individual ``sglang serve`` launches and publishes its address in
+``SGLANG_FORKSERVER_FILE``; a launcher attaches to it when present, so the
+preload cost is paid once per machine instead of once per launch.
 
 This module is first in the preload list: importing it inside the forkserver
 installs the child-side patches. Forkserver children inherit the *server's*
@@ -57,6 +63,8 @@ def start_early() -> None:
     mp.set_start_method("forkserver", force=True)
     mp.set_forkserver_preload(PRELOAD)
     _install_process_patches()
+    if _try_attach_daemon(fs=fs):
+        return
     fs.ensure_running()
     # Published so children forked from the server (the DP controller) reuse it,
     # instead of starting a second forkserver with the default preload.
@@ -80,6 +88,53 @@ def _configure_forkserver_env() -> None:
 def _publish_forkserver(*, address: str, pid: int) -> None:
     envs.SGLANG_FORKSERVER_ADDRESS.set(address)
     envs.SGLANG_FORKSERVER_PID.set(pid)
+
+
+def _try_attach_daemon(*, fs) -> bool:
+    """Reuse a daemon forkserver, which has already imported the worker stack.
+    The launcher holds one end of a pipe as the protocol's alive fd."""
+    path = envs.SGLANG_FORKSERVER_FILE.get()
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        info = read_daemon_info(path)
+    except Exception as e:  # stale file, dead daemon, permission
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[early_forkserver] daemon at %s unusable (%s); starting a private one",
+            path,
+            e,
+        )
+        return False
+    inst = fs._forkserver
+    inst._forkserver_address = info["address"]
+    inst._forkserver_pid = info["pid"]
+    r, w = os.pipe()
+    inst._forkserver_alive_fd = w
+    inst._keep_r = r  # never closed on purpose: it is the children's alive fd
+    inst.ensure_running = lambda: None
+    _publish_forkserver(address=info["address"], pid=info["pid"])
+    return True
+
+
+def read_daemon_info(path: str) -> Dict[str, object]:
+    """Load a daemon file, requiring both processes alive and not zombies and
+    the listener socket present; raises on anything else."""
+    import json
+
+    with open(path) as f:
+        info = json.load(f)
+    addr, pid = info["address"], int(info["pid"])
+    for check_pid in (pid, int(info.get("daemon_pid", pid))):
+        os.kill(check_pid, 0)  # raises ProcessLookupError if gone
+        if _is_zombie(check_pid):
+            raise ProcessLookupError(f"pid {check_pid} is a zombie")
+    # Do NOT probe-connect: the forkserver main loop treats a connection that
+    # sends nothing as a fatal EOF and exits.
+    if not os.path.exists(addr):
+        raise FileNotFoundError(addr)
+    return {"address": addr, "pid": pid}
 
 
 def _is_zombie(pid: int) -> bool:
@@ -129,8 +184,8 @@ def _install_process_patches() -> None:
         # Workers signal and watch their psutil parent, which under a forkserver
         # is the forkserver, so carry the logical parent along.
         setattr(self, _PARENT_ATTR, os.getpid())
-        # Forkserver children inherit the *server's* stdio; hand the child the
-        # stdout/stderr of the process that started it.
+        # Forkserver children inherit the *server's* stdio. With a shared daemon
+        # that is the daemon's log, so hand the child our own stdout/stderr.
         try:
             setattr(self, _STDIO_ATTR, (_FdHandle(1), _FdHandle(2)))
         except Exception:
@@ -166,7 +221,7 @@ def merge_launcher_env(
     server_initial: Mapping[str, str],
 ) -> Dict[str, str]:
     """Environment a forked child runs with: the launcher's wins, variables only
-    the forkserver had are dropped, variables its preload imports set are kept."""
+    the daemon had are dropped, variables its preload imports set are kept."""
     merged = {
         k: v for k, v in current.items() if k in launcher or k not in server_initial
     }
@@ -241,7 +296,7 @@ def _pid_alive(pid: int) -> bool:
 
 def sync_offline_flags(environ: Mapping[str, str], modules: Mapping[str, object]):
     """huggingface_hub reads HF_HUB_OFFLINE into module constants at import, in
-    the forkserver's environment; re-derive them from the launcher's."""
+    the daemon's environment; re-derive them from the launcher's."""
     val = environ.get("HF_HUB_OFFLINE", "")
     offline = val.lower() in ("1", "true", "yes", "on")
     hub = modules.get("huggingface_hub.constants")
@@ -447,3 +502,67 @@ def _configure_forkserver_process() -> None:
 
 if enabled() and _in_forkserver_process():
     _configure_forkserver_process()
+
+
+# ---------------------------------------------------------------------------
+# Daemon: `python -m sglang.srt.entrypoints.early_forkserver`
+# ---------------------------------------------------------------------------
+
+
+def run_daemon() -> None:
+    """Start a preloaded forkserver that outlives individual launches. It must
+    run the same environment and code as the servers that will use it."""
+    import json
+    import multiprocessing.forkserver as fs
+    import signal
+    import time
+
+    envs.SGLANG_EARLY_FORKSERVER.set(True)
+    _configure_forkserver_env()
+    mp.set_start_method("forkserver", force=True)
+    mp.set_forkserver_preload(PRELOAD)
+    _install_process_patches()
+    t0 = time.time()
+    fs.ensure_running()
+    # Force the preload now (the server imports lazily on first connect otherwise).
+    p = mp.Process(target=_noop)
+    p.start()
+    p.join()
+    inst = fs._forkserver
+    path = envs.SGLANG_FORKSERVER_FILE.get()
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(
+            {
+                "address": inst._forkserver_address,
+                "pid": inst._forkserver_pid,
+                "daemon_pid": os.getpid(),
+            },
+            f,
+        )
+    os.replace(tmp, path)
+    print(
+        f"[early_forkserver] daemon ready in {time.time() - t0:.1f} s: "
+        f"address={inst._forkserver_address} pid={inst._forkserver_pid} file={path}",
+        flush=True,
+    )
+
+    def _cleanup(*_):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _cleanup)
+    signal.signal(signal.SIGINT, _cleanup)
+    while True:
+        time.sleep(3600)
+
+
+def _noop():
+    pass
+
+
+if __name__ == "__main__":
+    run_daemon()
