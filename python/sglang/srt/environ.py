@@ -299,6 +299,10 @@ class Envs:
     # Process() calls reuse it. Set by start_early(); not meant to be set by hand.
     SGLANG_FORKSERVER_ADDRESS = EnvStr(None)
     SGLANG_FORKSERVER_PID = EnvInt(None)
+    # Spawn the scheduler / DP-controller processes right after argument
+    # parsing, before the launcher imports the HTTP and tokenizer stack
+    # (entrypoints/prespawn.py).
+    SGLANG_PRESPAWN_WORKERS = EnvBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
