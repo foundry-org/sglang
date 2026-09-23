@@ -985,6 +985,10 @@ class InklingMoE(nn.Module):
     ) -> torch.Tensor | None:
         if self.shared_experts is None:
             return None
+        if hidden_states.shape[0] == 0:
+            # Idle DP-attention rank: no tokens. The shared experts are local
+            # (no collective), and their kernels cannot take an empty batch.
+            return None
         if self.shared_expert_sink:
             if isinstance(self.shared_experts, InklingBatchDenseMLP):
                 assert shared_gammas is not None
