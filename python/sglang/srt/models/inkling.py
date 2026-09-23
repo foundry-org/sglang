@@ -937,6 +937,15 @@ class InklingCausalLLM(nn.Module):
                     hidden_states = all_gather_hidden(
                         hidden_states, self.layers[-1].attn_tp_group
                     )
+        if forward_batch.forward_mode.is_idle() or hidden_states.shape[0] == 0:
+            # Idle DP-attention rank (no tokens this step): the layers were skipped,
+            # residual is None and RMSNorm's empty-input fast path returns the bare
+            # tensor, so there is nothing to normalize or unpack.
+            return (
+                (hidden_states, aux_hidden_states)
+                if self._dflash_layers_to_capture
+                else hidden_states
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return (
             (hidden_states, aux_hidden_states)
