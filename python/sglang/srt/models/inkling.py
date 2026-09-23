@@ -463,6 +463,12 @@ class InklingDecoderLayer(nn.Module):
         NEXT consumer (layer or tail) fuses its AR the same way. The caller
         (InklingCausalLLM) threads both consistently."""
         if forward_batch.forward_mode.is_idle():
+            # Idle DP-attention rank (no tokens this step). Attention and the
+            # sconvs have nothing to do, but the MoE's expert dispatch/combine
+            # (DeepEP) and its all-reduce are collectives over all EP / TP ranks
+            # that the active ranks are blocked on, so run the MoE on the empty
+            # batch, as the Qwen MoE layers do on idle ranks.
+            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
             return hidden_states, residual
 
         # The eager group reads the LIVE forward_batch from the tc_piecewise context
