@@ -16,8 +16,16 @@ from sglang.srt.configs.inkling import (
 )
 from sglang.srt.distributed import (
     get_tensor_model_parallel_group,
+    get_tp_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    dp_gather_replicate,
+    dp_scatter,
+    get_global_dp_buffer,
+    get_local_dp_buffer,
+    is_dp_attention_enabled,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_runner_backend
@@ -437,6 +445,39 @@ class InklingDecoderLayer(nn.Module):
         if out.shape[0] != n:
             out[n:].zero_()
 
+    def _run_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        reduce: bool = True,
+    ) -> torch.Tensor:
+        """Run the MoE; under DP attention, on the global batch.
+
+        Inkling's MoE is TP-style (each rank computes its local experts and the
+        shared-expert shard, then all-reduces over the TP group), so under DP
+        attention every rank must hold the same tokens: gather the DP ranks'
+        rows into the global buffer (replicated), run the MoE with its
+        all-reduce there, and scatter this rank's rows back. An idle rank (no
+        tokens) takes the same path with zero local rows and so joins every
+        collective. The fused all-reduce/sconv kernels assume the all-reduce
+        runs on local rows and are disabled under DP attention (see the
+        fusable gates in kernels/comm.py), hence ``reduce`` is always True here.
+        """
+        if not is_dp_attention_enabled():
+            return self.mlp(hidden_states, forward_batch=forward_batch, reduce=reduce)
+        assert reduce, "fused all-reduce paths are disabled under DP attention"
+        assert not self.scattered_sconv, (
+            "--enable-scattered-sconv is not supported with DP attention"
+        )
+        global_hidden = get_global_dp_buffer(get_tp_group())
+        dp_gather_replicate(global_hidden, hidden_states, forward_batch)
+        global_out = self.mlp(global_hidden, forward_batch=forward_batch)
+        par = get_parallel()
+        group = get_tp_group() if par.tp_size == par.attn_dp_size else par.attn_tp_group
+        local_out = get_local_dp_buffer(group)
+        dp_scatter(local_out, global_out, forward_batch)
+        return local_out[: hidden_states.shape[0]]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -468,7 +509,7 @@ class InklingDecoderLayer(nn.Module):
             # (DeepEP) and its all-reduce are collectives over all EP / TP ranks
             # that the active ranks are blocked on, so run the MoE on the empty
             # batch, as the Qwen MoE layers do on idle ranks.
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+            hidden_states = self._run_mlp(hidden_states, forward_batch)
             return hidden_states, residual
 
         # The eager group reads the LIVE forward_batch from the tc_piecewise context
@@ -506,7 +547,7 @@ class InklingDecoderLayer(nn.Module):
             hidden_states, residual = self.mlp_norm(attn_out, residual_out)
             del attn_out
             del residual_out
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+            hidden_states = self._run_mlp(hidden_states, forward_batch)
             return hidden_states, residual
 
         # Plain eager / decode: run inline (still deferring mlp_sconv so the
@@ -570,11 +611,9 @@ class InklingDecoderLayer(nn.Module):
         if fuse_ar_sconv and self.mlp_ar_fusable:
             # Skip the MoE's own all-reduce; the next layer (or the model tail)
             # fuses {AR -> this layer's mlp_sconv -> norm} into one kernel.
-            hidden_states = self.mlp(
-                hidden_states, forward_batch=forward_batch, reduce=False
-            )
+            hidden_states = self._run_mlp(hidden_states, forward_batch, reduce=False)
         else:
-            hidden_states = self.mlp(hidden_states, forward_batch=forward_batch)
+            hidden_states = self._run_mlp(hidden_states, forward_batch)
         return hidden_states, residual
 
 

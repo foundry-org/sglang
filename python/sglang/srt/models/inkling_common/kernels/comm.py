@@ -230,6 +230,12 @@ def take_ar_shared(num_tokens: int) -> torch.Tensor | None:
     return shared
 
 
+def _dp_attention_enabled() -> bool:
+    from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+
+    return is_dp_attention_enabled()
+
+
 def ar_sconv_norm_fusable(
     group: GroupCoordinator,
     forward_batch,
@@ -244,6 +250,11 @@ def ar_sconv_norm_fusable(
     (kernels/ops/communication/inkling_ar_fused.py). Must be
     evaluated identically by the producing layer (MoE ``reduce=False``) and the
     consuming layer/tail -- it is a pure function of per-forward state."""
+    if _dp_attention_enabled():
+        # Under DP attention the MoE all-reduce runs on the gathered global batch
+        # (InklingDecoderLayer._run_mlp); fusing it into the next layer's local
+        # sconv would reduce local rows across ranks that hold different tokens.
+        return False
     if not is_cuda():
         return False
     if not (
@@ -696,6 +707,11 @@ def scattered_ar_sconv_fusable(
     per-forward
     state -- the producing layer (reduce=False) and the consuming site must
     evaluate it identically."""
+    if _dp_attention_enabled():
+        # Under DP attention the MoE all-reduce runs on the gathered global batch
+        # (InklingDecoderLayer._run_mlp); fusing it into the next layer's local
+        # sconv would reduce local rows across ranks that hold different tokens.
+        return False
     if not is_cuda():
         return False
     if not (
@@ -1033,6 +1049,11 @@ def fullwidth_ar_sconv_fusable(
     it identically. Mutually exclusive with ``ar_sconv_norm_fusable`` by mode
     (extend vs decode/verify) and with ``scattered_ar_sconv_fusable`` by the
     scattered flag."""
+    if _dp_attention_enabled():
+        # Under DP attention the MoE all-reduce runs on the gathered global batch
+        # (InklingDecoderLayer._run_mlp); fusing it into the next layer's local
+        # sconv would reduce local rows across ranks that hold different tokens.
+        return False
     if not is_cuda():
         return False
     if not (
