@@ -35,6 +35,7 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+    get_embedding_tp_kwargs,
 )
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
@@ -628,11 +629,16 @@ class InklingCausalLLM(nn.Module):
         self.config = config
         self.padded_vocab_size = config.padded_vocab_size
 
+        # Under DP attention each rank embeds only its own tokens, so the
+        # vocab-sharded embedding must reduce within the attention-TP group,
+        # not the full TP group (an all-reduce of per-rank-different rows over
+        # all ranks mixes tokens and, with uneven/idle ranks, mismatches).
         self.embed_tokens = VocabParallelEmbedding(
             self.padded_vocab_size,
             config.hidden_size,
             org_num_embeddings=self.padded_vocab_size,
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
         self.embed_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1761,11 +1767,13 @@ class InklingMTPLayer(nn.Module):
     ) -> None:
         super().__init__()
 
+        # Same layout as the target's embedding (the weight is shared).
         self.embed_tokens = VocabParallelEmbedding(
             config.padded_vocab_size,
             config.hidden_size,
             org_num_embeddings=config.padded_vocab_size,
             prefix=add_prefix("embed_tokens", prefix),
+            **get_embedding_tp_kwargs(),
         )
         self.main_model_embed_norm = (
             RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
