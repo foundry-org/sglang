@@ -495,17 +495,27 @@ def handle_graph_extension(server_args: Any):
     cfg = resolving_view(server_args)
     if not cfg.foundry_graph_extension_config_path:
         return
-    # Foundry persists full decode graphs only: prefill capture (BCG is the
-    # CUDA default) is not covered by its archive format, and autotune /
-    # profiling must stay off so SAVE and LOAD take identical allocation paths.
-    declare_resolution(
-        server_args,
-        "_handle_graph_extension",
+    # Foundry persists full CUDA graphs only: decode is pinned to full, and
+    # prefill stays off unless full is requested explicitly (the default, BCG
+    # on CUDA, and tc_piecewise are not covered by its archive format; leaving
+    # the field unset here would also let a model default such as Inkling's
+    # pick it). Autotune / profiling must stay off so SAVE and LOAD take
+    # identical allocation paths.
+    prefill = cfg.cuda_graph_backend_prefill
+    if prefill not in (None, Backend.FULL, Backend.DISABLED):
+        raise ValueError(
+            f"--cuda-graph-backend-prefill={prefill!r} is not supported with "
+            "--foundry-graph-extension-config-path: Foundry persists full "
+            "prefill graphs only; use 'full' or 'disabled'."
+        )
+    fields = dict(
         cuda_graph_backend_decode="full",
-        cuda_graph_backend_prefill="disabled",
         enable_profile_cuda_graph=False,
         disable_flashinfer_autotune=True,
     )
+    if prefill is None:
+        fields["cuda_graph_backend_prefill"] = Backend.DISABLED
+    declare_resolution(server_args, "_handle_graph_extension", **fields)
     from sglang.srt.foundry_shim import apply_server_args
 
     apply_server_args(server_args)
