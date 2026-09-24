@@ -465,7 +465,11 @@ class InklingDecoderLayer(nn.Module):
         fusable gates in kernels/comm.py), hence ``reduce`` is always True here.
         """
         if not is_dp_attention_enabled():
-            return self.mlp(hidden_states, forward_batch=forward_batch, reduce=reduce)
+            # Dense MLP layers take no reduce kwarg; only the fusable MoE
+            # branch turns the all-reduce off.
+            if reduce:
+                return self.mlp(hidden_states, forward_batch=forward_batch)
+            return self.mlp(hidden_states, forward_batch=forward_batch, reduce=False)
         assert reduce, "fused all-reduce paths are disabled under DP attention"
         assert not self.scattered_sconv, (
             "--enable-scattered-sconv is not supported with DP attention"
