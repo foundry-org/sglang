@@ -52,6 +52,9 @@ class TorchSymmMemCommunicator:
         9: [4, 6, 8],
         10: [4, 6, 8],
     }
+    # torch's two_shot_all_reduce_ is instantiated for these world sizes only
+    # (DISPATCH_WORLD_SIZES_NO_DEFAULT in CUDASymmetricMemoryOps.cu).
+    _WORLD_SIZES_TWO_SHOT = (2, 4, 8)
 
     def __init__(self, group: ProcessGroup, device: Union[int, str, torch.device]):
         """
@@ -113,14 +116,30 @@ class TorchSymmMemCommunicator:
             dtype=self.dtype,
         )
         handle = torch_symm_mem.rendezvous(self.buffer, self.group.group_name)
+        multimem_world_size = self.world_size in self._WORLD_SIZES_MULTIMEM.get(
+            self.device_capability, ()
+        )
+        self.use_multimem = multimem_world_size and handle.multicast_ptr != 0
         if handle.multicast_ptr == 0:
+            # Only the multimem kernel needs a multicast mapping; two-shot runs
+            # on plain peer pointers. Multicast can be unavailable while p2p
+            # works (e.g. NVSwitch fabric-handle multicast without IMEX
+            # channels configured), so fall back to two-shot wherever torch
+            # instantiates it and disable only the remaining world sizes.
+            if self.world_size not in self._WORLD_SIZES_TWO_SHOT:
+                logger.warning(
+                    "TorchSymmMemCommunicator: torch symmetric memory "
+                    "multicast operations are not supported and two-shot is "
+                    "not available for world size %d, communicator disabled.",
+                    self.world_size,
+                )
+                self.buffer = None
+                self.disabled = True
+                return
             logger.warning(
-                "TorchSymmMemCommunicator: torch symmetric memory "
-                "multicast operations are not supported."
+                "TorchSymmMemCommunicator: multicast unavailable; "
+                "using the two-shot all-reduce kernel."
             )
-            self.buffer = None
-            self.disabled = True
-            return
         self.disabled = False
 
     def should_torch_symm_mem_allreduce(self, inp: torch.Tensor):
@@ -171,9 +190,7 @@ class TorchSymmMemCommunicator:
         if out is None:
             out = torch.empty_like(inp)
         self.buffer[: inp.numel()].copy_(inp.view(-1))
-        if self.world_size in self._WORLD_SIZES_MULTIMEM.get(
-            self.device_capability, ()
-        ):
+        if self.use_multimem:
             torch.ops.symm_mem.multimem_all_reduce_(
                 self.buffer[: inp.numel()], "sum", self.group.group_name
             )
