@@ -191,7 +191,11 @@ def install_worker_probe(rank):
                     'max_abs': float((cpu_reference.float() - saved.float()).abs().max().item()),
                     'elements': saved.numel()}
                 if cfg.get('diagnostic_save_mismatch'):
-                    from logit_diagnostics import compare_logits
+                    from logit_diagnostics import compare_logits, correlate_saved_tokens
+                    saved_generations = json.loads((Path(cfg['save_reference'])/'generation_checks.json').read_text())
+                    saved_generation = next(row for row in saved_generations if row['phase']['batch'] == phase['batch'])
+                    report['saved_token_input_correlation'] = correlate_saved_tokens(
+                        diagnostic_inputs, phase, saved_generation, cfg['prompt_tokens'])
                     report['cross_process_diagnostic'] = compare_logits(cpu_reference, saved, torch)
                     diagnostic_path = out / f"phase_{phase['id']:04d}_reference_tensors.pt"
                     torch.save({'actual': cpu_reference, 'save': saved,

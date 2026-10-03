@@ -56,3 +56,37 @@ def live_inputs(batch, runner, size, torch):
         return result
     return {'forward_batch':fields(batch),'captured_input_buffers':fields(runner.buffers,truncate=True),
             'note':'Recorded before selected actual replay; CUDA-to-CPU copies excluded from timing.'}
+
+
+def correlate_saved_tokens(inputs, phase, saved_generation, prompt_tokens):
+    """Use explicit request IDs, never assume scheduler row order matches submission."""
+    live=inputs.get('forward_batch',{})
+    graph=inputs.get('captured_input_buffers',{})
+    rids=live.get('rids')
+    tokens=(graph.get('input_ids') or {}).get('values')
+    positions=(graph.get('positions') or {}).get('values')
+    submitted=phase.get('request_ids')
+    if not (isinstance(rids,list) and isinstance(tokens,list) and isinstance(positions,list)
+            and isinstance(submitted,list) and len(rids)==len(tokens)==len(positions)):
+        return {'mapping_available':False,'reason':'Missing exact live request IDs/input IDs/positions',
+                'saved_reference_live_state_known':False}
+    rows=[]
+    for row,(rid,token,position) in enumerate(zip(rids,tokens,positions)):
+        matches=[i for i,name in enumerate(submitted) if name==rid]
+        item={'row':row,'rid':rid,'actual_input_id':token,'position':position,
+              'expected_first_decode_position':prompt_tokens,'request_index':None}
+        if len(matches)==1:
+            index=matches[0];sequence=saved_generation['tokens'][index]
+            step=position-prompt_tokens
+            expected=sequence[step] if isinstance(step,int) and 0<=step<len(sequence) else None
+            item.update(request_index=index,save_first_generated_token=sequence[0],
+                        decode_step_from_position=step,save_token_at_position=expected,
+                        input_matches_save_first_token=token==sequence[0],
+                        input_matches_save_token_at_position=expected is not None and token==expected)
+        rows.append(item)
+    return {'mapping_available':all(r['request_index'] is not None for r in rows),
+            'saved_reference_live_state_known':False,
+            'all_rows_at_first_decode':all(r['position']==prompt_tokens for r in rows),
+            'all_inputs_match_save_at_position':all(r.get('input_matches_save_token_at_position',False) for r in rows),
+            'rows':rows,
+            'note':'Original SAVE reference has no retained live positions. This mapping tests current LOAD inputs against per-request SAVE output tokens; it does not prove the old reference was taken at the same step.'}
