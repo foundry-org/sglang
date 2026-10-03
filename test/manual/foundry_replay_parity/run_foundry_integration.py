@@ -305,6 +305,10 @@ def main():
     ap.add_argument('--mem-fraction-static', type=float, default=0.45)
     ap.add_argument('--foundry-config', help='Use an existing TOML instead of generated config')
     args = ap.parse_args()
+    if args.mode == 'load' and not args.save_reference:
+        raise ValueError('LOAD requires --save-reference for independent-process correctness')
+    if args.save_reference:
+        args.save_reference = str(Path(args.save_reference).resolve())
     out, archive = Path(args.output).resolve(), Path(args.archive).resolve()
     out.mkdir(parents=True, exist_ok=True)
     if (out / 'metadata.json').exists():

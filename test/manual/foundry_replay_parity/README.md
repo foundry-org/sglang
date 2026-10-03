@@ -55,4 +55,6 @@ This is a bounded synchronous correctness/replay experiment. It does not prove s
 
 SAVE/capture timing and LOAD timing occur in separate processes, so they are context rather than a paired speed ratio. The primary performance comparison is the same-process updated-vs-fresh pair; the independent SAVE output comparison prevents two equally incorrect LOAD variants from passing.
 
+The first ordinary backend replay is checked against the independent SAVE tensor before timing. It is not pre-poisoned; the subsequent bounded candidate and fresh validation launches are each NaN-poisoned before and after timing.
+
 The preserved standalone protocol supplied `backend_assertions.py`, `dp_probe.py`, the bootstrap loader and CPU helpers. These local copies keep the manual test reproducible without requiring a separate experiment directory on `PYTHONPATH`.
