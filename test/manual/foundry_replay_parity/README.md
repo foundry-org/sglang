@@ -70,3 +70,13 @@ Only in this explicit mode may the run continue past a cross-process SAVE mismat
 An actual DeepEP LOAD diagnostic selected rank 0 at decode position 65 and rank 1 at 64 for the same balanced batch. The earlier batch-only SAVE reference did not retain its live positions. Rank 0 then differed in raw logits even in the initial template phase with no execUpdate, while candidate/fresh were bitwise identical and all generated tokens matched independent SAVE. “First decode” in earlier descriptions must therefore mean first **eligible probe** replay, not necessarily each request's first decode step.
 
 A future independent raw-logit reference must use request identity plus decode position and prompt/prefix identity. The current diagnostic status remains unaccepted for independently aligned raw-logit correctness; within-state candidate/fresh and end-to-end token comparisons retain their separate meanings.
+
+## Expiring GPU assignments
+
+Start the local [deadline-based rsync supervisor](env/RESULT_BACKUP_ZH.md) **before** a remote run and require its first pull to succeed. It copies reports/archives/reference banks/artifacts periodically, increases frequency near the known deadline, preserves previous local files and versions, and emits a stop-starting-jobs marker with five minutes reserved. No host installation, cron, remote source modification or deletion synchronization is used. A successful GPU process exit is not a substitute for locally retained raw results.
+
+```sh
+python3 -m unittest discover -s env -p 'test_result_backup.py' -v
+```
+
+These backup-only additions postdate the GPU measurements made with harness commit `3c9dc75c9f`; use each run's source snapshot as its measurement identity.
