@@ -139,6 +139,10 @@ def install_worker_probe(rank):
             if cfg['mode'] == 'load':
                 from foundry import research_qmd
                 state_before = research_qmd.state(graph)
+            diagnostic_inputs = None
+            if cfg.get('diagnostic_save_mismatch'):
+                from logit_diagnostics import live_inputs
+                diagnostic_inputs = live_inputs(batch, runner, int(key.size), torch)
             # At this boundary the runner already populated the current inputs.
             # Poison before the first actual backend launch selected for a phase.
             initial_logits = backend._outputs[key].next_token_logits
@@ -165,6 +169,8 @@ def install_worker_probe(rank):
                       'baseline_logits_sha256': hashlib.sha256(reference.view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
                       'validation': [], 'timings': {}, 'mode': cfg['mode'], 'admission': dp_admission,
                       'initial_actual_replay_poisoned': True,
+                      'diagnostic_only': bool(cfg.get('diagnostic_save_mismatch')),
+                      'live_inputs': diagnostic_inputs,
                       'scope': 'Actual Foundry SAVE capture or independent LOAD graph replay at live SGLang decode boundary'}
             if backend_observer is not None:
                 report['communication_backend'] = backend_observer[1](graph)
@@ -184,7 +190,21 @@ def install_worker_probe(rank):
                     'argmax': bool(torch.equal(cpu_reference.argmax(-1), saved.argmax(-1))),
                     'max_abs': float((cpu_reference.float() - saved.float()).abs().max().item()),
                     'elements': saved.numel()}
-                if not exact_saved:
+                if cfg.get('diagnostic_save_mismatch'):
+                    from logit_diagnostics import compare_logits
+                    report['cross_process_diagnostic'] = compare_logits(cpu_reference, saved, torch)
+                    diagnostic_path = out / f"phase_{phase['id']:04d}_reference_tensors.pt"
+                    torch.save({'actual': cpu_reference, 'save': saved,
+                                'live_inputs': diagnostic_inputs}, diagnostic_path)
+                    report['diagnostic_tensor_path'] = str(diagnostic_path)
+                    # Every rank records before proceeding. Reference differences
+                    # remain failures and cannot promote a diagnostic run to pass.
+                    verdicts = [None] * world
+                    torch.distributed.all_gather_object(verdicts, exact_saved, group=group)
+                    report['all_rank_independent_save_matches'] = verdicts
+                    report['independent_save_requirement_passed'] = all(verdicts)
+                    write_json(out / f"phase_{phase['id']:04d}.json", report)
+                elif not exact_saved:
                     write_json(out / f"phase_{phase['id']:04d}.json", report)
                     raise RuntimeError('Independent SAVE/LOAD complete logits differ')
             variants = {'actual': graph.replay}
@@ -315,6 +335,8 @@ def main():
     ap.add_argument('--sequence', default='2,4,2')
     ap.add_argument('--manifest-sequence', action='store_true')
     ap.add_argument('--save-reference', help='SAVE report directory: require exact independent-process logits and generated tokens')
+    ap.add_argument('--diagnostic-save-mismatch', action='store_true',
+                    help='Preserve cross-process mismatch tensors/inputs and continue diagnosis; never produces passed status, updated/fresh remains strict')
     ap.add_argument('--blocks', type=int, default=11)
     ap.add_argument('--launches', type=int, default=32)
     ap.add_argument('--prompt-tokens', type=int, default=64)
@@ -394,12 +416,12 @@ def main():
         engine = Engine(**options)
         meta['resolved_engine_config'] = resolved_prefill_snapshot(engine)
         write_json(out / 'metadata.json', meta)
-        def generate(prompts, params):
+        def generate(prompts, params, request_ids=None):
             if args.target_backend != 'deepep_dp':
-                return engine.generate(input_ids=prompts, sampling_params=params)
+                return engine.generate(input_ids=prompts, sampling_params=params, rid=request_ids)
             async def both():
                 n = len(prompts)//2
-                return await asyncio.gather(*(engine.async_generate(input_ids=prompts[r*n:(r+1)*n], sampling_params=params, routed_dp_rank=r) for r in range(2)))
+                return await asyncio.gather(*(engine.async_generate(input_ids=prompts[r*n:(r+1)*n], sampling_params=params, routed_dp_rank=r, rid=request_ids[r*n:(r+1)*n] if request_ids else None) for r in range(2)))
             groups = engine.loop.run_until_complete(both())
             return [item for group in groups for item in (group if isinstance(group,list) else [group])]
         for index, batch in enumerate(sequence):
@@ -407,10 +429,16 @@ def main():
             prompts = [[100 + (i+j+batch*17)%200 for j in range(args.prompt_tokens)] for i in range(count)]
             params = {'temperature':0,'max_new_tokens':args.generate_tokens,'ignore_eos':True}
             phase = {'armed':True,'id':index,'batch':batch,'global_batch':count}
+            request_ids = ([f'foundry-b{batch}-p{index}-probe-{i}' for i in range(count)]
+                           if args.diagnostic_save_mismatch else None)
+            if request_ids is not None:
+                phase['request_ids'] = request_ids
             write_json(phase_file, phase)
-            actual = generation_ids(generate(prompts, params))
+            actual = generation_ids(generate(prompts, params, request_ids))
             write_json(phase_file, {'armed':False})
-            repeated = generation_ids(generate(prompts, params))
+            repeat_ids = ([f'foundry-b{batch}-p{index}-repeat-{i}' for i in range(count)]
+                          if args.diagnostic_save_mismatch else None)
+            repeated = generation_ids(generate(prompts, params, repeat_ids))
             covered = [(out / f'rank_{rank}' / f'phase_{index:04d}.json').exists() for rank in range(tp)]
             check = {'phase':phase,'tokens':actual,'repeated_tokens':repeated,'exact_match':actual == repeated,'rank_coverage':covered, 'input_ids':prompts}
             if args.save_reference:
@@ -420,13 +448,13 @@ def main():
                     raise RuntimeError(f'No matching SAVE inputs for batch {batch}')
                 check['independent_save_tokens'] = matches[0]['tokens']
                 check['independent_save_exact_match'] = matches[0]['tokens'] == actual
-                if not check['independent_save_exact_match']:
+                if not check['independent_save_exact_match'] and not args.diagnostic_save_mismatch:
                     checks.append(check)
                     write_json(out/'generation_checks.json',checks)
                     raise RuntimeError('Independent SAVE/LOAD generation tokens differ')
             checks.append(check)
             write_json(out/'generation_checks.json',checks)
-            if actual != repeated or not all(covered):
+            if (actual != repeated and not args.diagnostic_save_mismatch) or not all(covered):
                 raise RuntimeError(f'Generation mismatch/missing graph phase {index}')
         aggregate = []
         for index in range(len(sequence)):
@@ -441,7 +469,9 @@ def main():
                 row.update(slowest_rank_timings=combined, paired_updated_vs_fresh=paired_ratios(combined,seed=args.seed+index))
             aggregate.append(row)
         write_json(out/'aggregate.json',{'phases':aggregate,'tp_size':tp,'mode':args.mode})
-        meta['status']='passed'
+        meta['status']='diagnostic_complete_not_accepted' if args.diagnostic_save_mismatch else 'passed'
+        if args.diagnostic_save_mismatch:
+            meta['performance_acceptance']='not_evaluated_diagnostic_only'
         if args.mode == 'save':
             meta['actual_save_manifests']=manifest_groups(archive)
     except BaseException as exc:

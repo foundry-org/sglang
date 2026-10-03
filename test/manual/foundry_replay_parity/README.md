@@ -58,3 +58,9 @@ SAVE/capture timing and LOAD timing occur in separate processes, so they are con
 All ranks reach a CPU admission decision before any early return or extra launch. At each selected phase the ordinary backend replay is NaN-poisoned before launch and checked against the independent SAVE tensor before timing. The subsequent bounded candidate and fresh validation launches are also NaN-poisoned before and after timing.
 
 The preserved standalone protocol supplied `backend_assertions.py`, `dp_probe.py`, the bootstrap loader and CPU helpers. These local copies keep the manual test reproducible without requiring a separate experiment directory on `PYTHONPATH`.
+
+## Explicit mismatch diagnostic
+
+`--diagnostic-save-mismatch` preserves full actual/SAVE CPU logits, row-level differences and top-two margins, exact row-permutation evidence, and the live ForwardBatch / captured input-buffer values before replay. Requests receive deterministic IDs so live rows can be associated with submitted prompts. This helps distinguish a different selected decode position or request order from an execUpdate error.
+
+Only in this explicit mode may the run continue past a cross-process SAVE mismatch to collect a fresh-LOAD comparison and generated-token evidence. Candidate/fresh poison validation remains strictly bitwise. Cross-process and repeated-generation mismatches remain recorded, and the run always ends with `diagnostic_complete_not_accepted`, never `passed`; no performance acceptance is inferred. The default strict behavior is unchanged.
