@@ -3,7 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 import unittest
-from state_reference_bank import (semantic_rows,row_key,common_lookup,add_entry,verify_load_prefixes,digest,global_state_id,Bank,seal,file_sha)
+from state_reference_bank import (semantic_rows,row_key,common_lookup,add_entry,verify_load_prefixes,digest,global_state_id,Bank,seal,file_sha,validate_global_rows)
 
 class StateBankContracts(unittest.TestCase):
     def setUp(self):
@@ -12,6 +12,8 @@ class StateBankContracts(unittest.TestCase):
                          'exact_match':True,'independent_save_exact_match':True}
         self.inputs={'forward_batch':{'rids':['b','a']},'captured_input_buffers':{
             'input_ids':{'values':[30,20]},'positions':{'values':[2,2]},'seq_lens':{'values':[3,3]}}}
+        for name in ('input_ids','positions','seq_lens'):
+            self.inputs['forward_batch'][name]=self.inputs['captured_input_buffers'][name]
     def rows(self): return semantic_rows(self.inputs,self.phase,self.generation,0,2)
     def test_first_decode_consumes_first_generated_only(self):
         row=self.rows()[0]
@@ -69,6 +71,21 @@ class StateBankContracts(unittest.TestCase):
         verify_load_prefixes([report],[self.generation]);self.assertTrue(evidence['actual_complete_prefix_verified'])
         bad=copy.deepcopy(self.generation);bad['input_ids'][1][0]=99
         with self.assertRaises(ValueError):verify_load_prefixes([report],[bad])
+    def test_live_graph_input_disagreement_rejects(self):
+        self.inputs['forward_batch']['input_ids']={'values':[99,20]}
+        with self.assertRaises(ValueError): self.rows()
+    def test_dp_global_coverage_rejects_duplicate_requests(self):
+        rows=self.rows()
+        for row in rows: row['global_batch']=4
+        second=[dict(row,rank=1) for row in rows]
+        with self.assertRaises(ValueError):validate_global_rows([rows,second])
+        for row in second:row['request_index']+=2
+        self.assertEqual(validate_global_rows([rows,second]),'partitioned_dp')
+    def test_tp_global_coverage_requires_complete_replicas(self):
+        rows=self.rows();second=[dict(row,rank=1) for row in rows]
+        self.assertEqual(validate_global_rows([rows,second]),'replicated_tp')
+        second[0]['request_index']=0
+        with self.assertRaises(ValueError):validate_global_rows([rows,second])
     def test_global_state_excludes_future_output(self):
         rows=self.rows(); changed=copy.deepcopy(rows);changed[0]['expected_next_token']=99
         self.assertEqual(global_state_id([rows]),global_state_id([changed]))

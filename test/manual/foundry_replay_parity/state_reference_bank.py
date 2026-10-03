@@ -51,6 +51,9 @@ def semantic_rows(inputs, phase, generation, rank, capture_batch):
     tokens = graph['input_ids']['values']
     positions = graph['positions']['values']
     lengths = graph['seq_lens']['values']
+    for name in ('input_ids','positions','seq_lens'):
+        if not isinstance(live.get(name),dict) or live[name].get('values')!=graph[name].get('values'):
+            raise ValueError(f'Live request metadata disagrees with captured {name}')
     if not len(rids) == len(tokens) == len(positions) == len(lengths) == capture_batch:
         raise ValueError('State bank requires exact complete capture rows')
     if len(set(rids)) != len(rids):
@@ -82,6 +85,25 @@ def semantic_rows(inputs, phase, generation, rank, capture_batch):
 def row_key(row):
     # Next token is an output check, never part of the consumed input identity.
     return digest({k:v for k,v in row.items() if k!='expected_next_token'})
+
+
+def validate_global_rows(rows_by_rank):
+    if not rows_by_rank or any(not rows for rows in rows_by_rank):
+        raise ValueError('Missing global request rows')
+    first=rows_by_rank[0][0]; count=first['global_batch']; capture=first['capture_batch']
+    for rank,rows in enumerate(rows_by_rank):
+        if any(row['rank']!=rank or row['global_batch']!=count or row['capture_batch']!=capture for row in rows):
+            raise ValueError('Global row rank/capture metadata disagree')
+    indices=[[row['request_index'] for row in rows] for rows in rows_by_rank]
+    if count==capture:
+        if any(sorted(values)!=list(range(count)) for values in indices):
+            raise ValueError('TP replica omits or duplicates submitted requests')
+        return 'replicated_tp'
+    if count==capture*len(rows_by_rank):
+        if sorted(i for values in indices for i in values)!=list(range(count)):
+            raise ValueError('DP global batch omits or duplicates submitted requests')
+        return 'partitioned_dp'
+    raise ValueError('Unsupported global request partition')
 
 
 def global_state_id(rows_by_rank):
@@ -150,9 +172,11 @@ class Bank:
         missing=[key for key in keys if key not in self.index]
         # Prefixes here are provisional until the real LOAD generation is checked.
         global_rows=[semantic_rows(item,phase,generation,r,size) for r,item in enumerate(global_inputs)]
+        coverage=validate_global_rows(global_rows)
         global_id=global_state_id(global_rows)
         evidence={'protocol':PROTOCOL,'assembly_mode':'per_request_prefix',
                   'scope_assumption':SCOPE,'rows':rows,'keys':keys,'missing_keys':missing,
+                  'global_request_coverage':coverage,
                   'global_logical_state_id':global_id,
                   'global_logical_state_identity':not missing and all(
                       any(o['global_logical_state_id']==global_id for o in self.index[k]['observations']) for k in keys),
@@ -184,6 +208,7 @@ def seal(root, generations, signature_value, manifests, world, torch):
             frame=json.loads(line); phase=frame['phase']; generation=byphase[phase['id']]
             rows=semantic_rows(frame['inputs'],phase,generation,rank,phase['batch'])
             global_rows=[semantic_rows(item,phase,generation,r,phase['batch']) for r,item in enumerate(frame['global_inputs'])]
+            validate_global_rows(global_rows)
             global_id=global_state_id(global_rows); globals_seen.add(global_id)
             path=folder/frame['tensor']
             if file_sha(path)!=frame['file_sha256']: raise ValueError('SAVE frame tensor changed')
@@ -223,6 +248,7 @@ def verify_load_prefixes(reports, checks):
             raise ValueError('Actual complete LOAD prefix differs from selected SAVE prefix')
         if 'global_inputs' in evidence:
             global_rows=[semantic_rows(item,phase,check,r,phase['batch']) for r,item in enumerate(evidence['global_inputs'])]
+            validate_global_rows(global_rows)
             if global_state_id(global_rows)!=evidence['global_logical_state_id']:
                 raise ValueError('Actual complete global LOAD logical state differs from lookup provenance')
         evidence['actual_complete_prefix_verified']=True
