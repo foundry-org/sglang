@@ -85,23 +85,21 @@ def install_worker_probe(rank):
         backend_observer = install(cfg['target_backend'])
     def replay(backend, key, batch, **kwargs):
         nonlocal driver, dp_replay_index
-        # The original SGLang adapter and Foundry CUDAGraph.replay perform the
-        # archive member selection, graph rewrite, exec update, and launch.
-        state_before = None
-        if cfg['mode'] == 'load':
-            from foundry import research_qmd
-            state_before = research_qmd.state(backend._graphs[key])
-        result = original(backend, key, batch, **kwargs)
-        phase = json.loads(Path(cfg['phase_file']).read_text())
         runner = backend._cuda_graph_runner
-        dp_admission = None
-        if cfg['target_backend'] == 'deepep_dp':
-            from dp_probe import make_offer, gather_and_decide
-            from sglang.srt.runtime_context import get_parallel
+        try:
             try:
+                phase = json.loads(Path(cfg['phase_file']).read_text())
+                phase_error = None
+            except Exception as exc:
+                phase, phase_error = {'armed': False}, repr(exc)
+            group = backend._tp_group.cpu_group
+            world = torch.distributed.get_world_size(group)
+            if cfg['target_backend'] == 'deepep_dp':
+                from dp_probe import make_offer, gather_and_decide
+                from sglang.srt.runtime_context import get_parallel
                 parallel = get_parallel()
-                group = backend._tp_group.cpu_group
-                world = torch.distributed.get_world_size(group)
+                if phase_error:
+                    phase = {'read_error': phase_error}
                 offer = make_offer(rank=rank, world_size=world, dp_rank=parallel.attn_dp_rank,
                     dp_size=parallel.attn_dp_size, attn_tp_size=parallel.attn_tp_size,
                     replay_index=dp_replay_index, phase=phase, seen_phase_ids=seen,
@@ -111,29 +109,44 @@ def install_worker_probe(rank):
                     require_mlp_tp_gather=runner.require_mlp_tp_gather,
                     can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
                     runner_name=type(runner).__name__)
-                dp_replay_index += 1
                 def gather(value):
                     values = [None] * world
                     torch.distributed.all_gather_object(values, value, group=group)
                     return values
                 decision, offers = gather_and_decide(offer, gather)
-                dp_admission = {'decision':decision,'offers':offers}
-                with (out/'dp_admission.jsonl').open('a') as stream:
-                    stream.write(json.dumps(dp_admission)+'\n')
-                if decision['action'] == 'reject':
-                    raise RuntimeError(f'DP admission rejected: {decision}')
-                if decision['action'] == 'skip':
-                    return result
-                phase = offers[0]['phase']
-            except BaseException as exc:
-                write_json(out/'dp_fail_stop.json', {'error':repr(exc),'admission':dp_admission})
-                os._exit(86)
-        elif (not phase.get('armed') or phase['id'] in seen or
-              type(runner).__name__ != 'DecodeCudaGraphRunner' or
-              not batch.forward_mode.is_decode() or
-              int(batch.batch_size) != phase['batch'] or int(key.size) != phase['batch']):
-            return result
-        try:
+            else:
+                from tp_probe import decide
+                offer = {'rank': rank, 'world_size': world, 'replay_index': dp_replay_index,
+                         'phase': phase, 'seen': phase.get('id') in seen,
+                         'runner_name': type(runner).__name__,
+                         'forward_mode': batch.forward_mode.name,
+                         'raw_batch': int(batch.batch_size), 'capture_batch': int(key.size),
+                         'error': phase_error}
+                offers = [None] * world
+                torch.distributed.all_gather_object(offers, offer, group=group)
+                decision = decide(offers)
+            dp_replay_index += 1
+            dp_admission = {'decision': decision, 'offers': offers}
+            with (out/'admission.jsonl').open('a') as stream:
+                stream.write(json.dumps(dp_admission)+'\n')
+            if decision['action'] == 'reject':
+                raise RuntimeError(f'Common probe admission rejected: {decision}')
+            if decision['action'] == 'skip':
+                return original(backend, key, batch, **kwargs)
+            phase = offers[0]['phase']
+            graph = backend._graphs[key]
+            state_before = None
+            if cfg['mode'] == 'load':
+                from foundry import research_qmd
+                state_before = research_qmd.state(graph)
+            # At this boundary the runner already populated the current inputs.
+            # Poison before the first actual backend launch selected for a phase.
+            initial_logits = backend._outputs[key].next_token_logits
+            if initial_logits is None or initial_logits.ndim != 2:
+                raise RuntimeError('Full output logits missing before original replay')
+            initial_logits.fill_(float('nan'))
+            # The actual adapter/Foundry replay performs member rewrite/update.
+            result = original(backend, key, batch, **kwargs)
             seen.add(phase['id'])
             graph = backend._graphs[key]
             if not type(graph).__module__.startswith('foundry'):
@@ -150,7 +163,8 @@ def install_worker_probe(rank):
                       'shape_key': repr(key), 'output_shape': list(logits.shape),
                       'capture_keys': [repr(k) for k in backend._graphs],
                       'baseline_logits_sha256': hashlib.sha256(reference.view(torch.uint8).cpu().numpy().tobytes()).hexdigest(),
-                      'validation': [], 'timings': {}, 'mode': cfg['mode'], 'dp_admission': dp_admission,
+                      'validation': [], 'timings': {}, 'mode': cfg['mode'], 'admission': dp_admission,
+                      'initial_actual_replay_poisoned': True,
                       'scope': 'Actual Foundry SAVE capture or independent LOAD graph replay at live SGLang decode boundary'}
             if backend_observer is not None:
                 report['communication_backend'] = backend_observer[1](graph)
@@ -202,6 +216,10 @@ def install_worker_probe(rank):
                 if driver is None:
                     driver = DriverGraph()
                 fresh, fresh_instantiate_us = driver.instantiate(int(state['source_graph']), flags=int(state['initial_flags']), register=False)
+                if fresh in (handle, int(info['template_exec'])):
+                    raise RuntimeError('Fresh executable aliases candidate or original template')
+                report['fresh_exec'] = fresh
+                report['variant_execs'] = {'updated': handle, 'fresh': fresh, 'original_template': int(info['template_exec'])}
                 report['fresh_instantiate_us'] = fresh_instantiate_us
                 report['fresh_source_graph'] = int(state['source_graph'])
                 stream = int(torch.cuda.current_stream().cuda_stream)
