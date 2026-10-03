@@ -80,9 +80,14 @@ def install_worker_probe(rank):
     driver = None
     dp_replay_index = 0
     backend_observer = None
+    bank = None
+    deferred = []
+    if cfg.get("state_reference_bank"):
+        from state_reference_bank import Bank
+        bank = Bank(cfg, rank, torch)
     if cfg['mode'] == 'save':
         from foundry_backend_capture import install
-        backend_observer = install(cfg['target_backend'])
+        backend_observer = install(cfg['target_backend'], strict_bank=bank is not None)
     def replay(backend, key, batch, **kwargs):
         nonlocal driver, dp_replay_index
         runner = backend._cuda_graph_runner
@@ -131,15 +136,60 @@ def install_worker_probe(rank):
                 stream.write(json.dumps(dp_admission)+'\n')
             if decision['action'] == 'reject':
                 raise RuntimeError(f'Common probe admission rejected: {decision}')
+            bank_inputs = global_inputs = None
+            collect_bank = False
+            if bank is not None and cfg['mode'] == 'save':
+                # Collector uses the exact same common admission, ignoring only
+                # whether this phase was already timed. No additional replay.
+                from dp_probe import decide as dp_decide
+                from tp_probe import decide as tp_decide
+                natural_offers = [dict(item, seen=False) for item in offers]
+                natural_decision = (dp_decide if cfg['target_backend']=='deepep_dp' else tp_decide)(natural_offers)
+                if natural_decision['action']=='reject':
+                    raise RuntimeError(f'Bank collection admission rejected: {natural_decision}')
+                collect_bank = natural_decision['action']=='probe'
+            if collect_bank or (bank is not None and decision['action']=='probe'):
+                from logit_diagnostics import live_inputs
+                bank_inputs = live_inputs(batch, runner, int(key.size), torch)
+                global_inputs = [None] * world
+                torch.distributed.all_gather_object(global_inputs, bank_inputs, group=group)
             if decision['action'] == 'skip':
-                return original(backend, key, batch, **kwargs)
+                result = original(backend, key, batch, **kwargs)
+                if collect_bank:
+                    bank.save_frame(result.next_token_logits, bank_inputs, global_inputs,
+                                    offers[0]['phase'], dp_replay_index-1)
+                return result
             phase = offers[0]['phase']
             graph = backend._graphs[key]
             state_before = None
             if cfg['mode'] == 'load':
                 from foundry import research_qmd
                 state_before = research_qmd.state(graph)
-            diagnostic_inputs = None
+            bank_reference = bank_evidence = None
+            if bank is not None and cfg['mode']=='load':
+                from state_reference_bank import common_lookup
+                lookup_error = None
+                try:
+                    bank_reference, bank_evidence = bank.lookup(bank_inputs, global_inputs, phase, int(key.size))
+                except Exception as exc:
+                    lookup_error = repr(exc)
+                lookups = [None] * world
+                torch.distributed.all_gather_object(lookups,
+                    {'error':lookup_error,'available':bank_reference is not None}, group=group)
+                bank_action = common_lookup(lookups)
+                if bank_action=='reject':
+                    raise RuntimeError(f'Bank input/reference lookup rejected: {lookups}')
+                if bank_action=='defer':
+                    result = original(backend, key, batch, **kwargs)
+                    after = research_qmd.state(graph)
+                    record = {'phase':phase,'replay_index':dp_replay_index-1,'lookup_verdicts':lookups,
+                              'bank_evidence':bank_evidence,'foundry_before':state_before,'foundry_after':after,
+                              'scope':'ordinary unmeasured replay; phase remains unconsumed'}
+                    deferred.append(record)
+                    with (out/'bank_deferred.jsonl').open('a') as f:
+                        f.write(json.dumps(record)+'\n')
+                    return result
+            diagnostic_inputs = bank_inputs
             if cfg.get('diagnostic_save_mismatch'):
                 from logit_diagnostics import live_inputs
                 diagnostic_inputs = live_inputs(batch, runner, int(key.size), torch)
@@ -176,12 +226,31 @@ def install_worker_probe(rank):
                 report['communication_backend'] = backend_observer[1](graph)
                 write_json(out/'communication_backend.json', backend_observer[0].snapshot())
             cpu_reference = reference.cpu()
+            if collect_bank:
+                bank.save_frame(cpu_reference, bank_inputs, global_inputs, phase, dp_replay_index-1)
+            if bank_evidence is not None:
+                exact_bank = bool(torch.equal(cpu_reference, bank_reference))
+                bank_evidence.update(per_request_prefix_bitwise_agreement=exact_bank,
+                    argmax=bool(torch.equal(cpu_reference.argmax(-1),bank_reference.argmax(-1))),
+                    max_abs=float((cpu_reference.float()-bank_reference.float()).abs().max().item()))
+                report['state_reference_bank'] = bank_evidence
+                report['deferred_natural_replays'] = [r for r in deferred if r['phase']['id']==phase['id']]
+                verdicts = [None] * world
+                torch.distributed.all_gather_object(verdicts,exact_bank,group=group)
+                report['cross_process_save_reference'] = {'protocol':bank_evidence['protocol'],
+                    'bitwise':exact_bank,'all_rank_bitwise':verdicts,
+                    'full_consumed_prefix_validation_pending':True}
+                if not all(verdicts):
+                    torch.save({'actual':cpu_reference,'assembled_save':bank_reference},
+                               out/f"phase_{phase['id']:04d}_bank_mismatch.pt")
+                    write_json(out/f"phase_{phase['id']:04d}.json",report)
+                    raise RuntimeError('State-aligned independent SAVE/LOAD complete logits differ')
             reference_path = out / 'references' / f"batch_{phase['batch']:04d}.pt"
             reference_path.parent.mkdir(exist_ok=True)
             if cfg['mode'] == 'save' and not reference_path.exists():
                 torch.save(cpu_reference, reference_path)
                 report['saved_reference'] = str(reference_path)
-            if cfg.get('save_reference'):
+            if cfg.get('save_reference') and bank is None:
                 saved_path = Path(cfg['save_reference']) / f'rank_{rank}' / 'references' / reference_path.name
                 saved = torch.load(saved_path, map_location='cpu', weights_only=True)
                 exact_saved = bool(torch.equal(cpu_reference, saved))
@@ -341,6 +410,7 @@ def main():
     ap.add_argument('--save-reference', help='SAVE report directory: require exact independent-process logits and generated tokens')
     ap.add_argument('--diagnostic-save-mismatch', action='store_true',
                     help='Preserve cross-process mismatch tensors/inputs and continue diagnosis; never produces passed status, updated/fresh remains strict')
+    ap.add_argument('--state-reference-bank', help='Opt-in strict per-request/prefix SAVE bank directory; SAVE creates new, LOAD requires sealed bank')
     ap.add_argument('--blocks', type=int, default=11)
     ap.add_argument('--launches', type=int, default=32)
     ap.add_argument('--prompt-tokens', type=int, default=64)
@@ -351,6 +421,26 @@ def main():
     args = ap.parse_args()
     if args.mode == 'load' and not args.save_reference:
         raise ValueError('LOAD requires --save-reference for independent-process correctness')
+    if args.state_reference_bank and args.diagnostic_save_mismatch:
+        raise ValueError('Strict state bank cannot use diagnostic mismatch continuation')
+    bank_signature = None
+    if args.state_reference_bank:
+        from state_reference_bank import signature
+        bank_signature = signature(args,json.loads((Path(args.model)/'config.json').read_text()))
+        routing_env = {name:os.environ.get(name,'0') for name in
+            ('SGLANG_SIMULATE_UNIFORM_EXPERTS','SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS')}
+        if any(v.lower() not in ('0','false','') for v in routing_env.values()):
+            raise ValueError(f'Routing simulation invalidates bank scope: {routing_env}')
+        bank_signature['routing_simulation_environment'] = routing_env
+        bank_signature['required_backend_options'] = required_backend_options(args.target_backend)
+        bank_signature['deepep_capacity_environment'] = os.environ.get('SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK','128')
+        args.state_reference_bank = str(Path(args.state_reference_bank).resolve())
+        if args.mode=='save':
+            Path(args.state_reference_bank).mkdir(parents=True,exist_ok=False)
+        else:
+            sealed=json.loads((Path(args.state_reference_bank)/'sealed.json').read_text())
+            if sealed['signature']!=bank_signature or not sealed['sealed_after_generation_validation']:
+                raise ValueError('Missing or incompatible sealed state bank')
     if args.save_reference:
         args.save_reference = str(Path(args.save_reference).resolve())
     out, archive = Path(args.output).resolve(), Path(args.archive).resolve()
@@ -363,6 +453,9 @@ def main():
         # Every captured shape receives one identical-input reference for LOAD.
         sequence = list(dict.fromkeys(capture + sequence))
     manifests = manifest_groups(archive) if args.mode == 'load' else None
+    if args.state_reference_bank and args.mode=='load':
+        if sealed['archive_manifest_sha256'] != [m['sha256'] for m in manifests]:
+            raise ValueError('State bank belongs to another actual Foundry archive')
     if args.manifest_sequence:
         if manifests is None:
             raise ValueError('Manifest sequence requires an actual SAVE archive')
@@ -392,7 +485,7 @@ def main():
                           f'workspace_root = {json.dumps(str(archive))}\nscratch_space_size = "1024MB"\ngraph_templates = true\n')
     phase_file = out / 'active_phase.json'
     write_json(phase_file, {'armed': False})
-    cfg = {**vars(args), 'output': str(out), 'phase_file': str(phase_file)}
+    cfg = {**vars(args), 'output': str(out), 'phase_file': str(phase_file), 'bank_signature':bank_signature}
     write_json(out / 'worker_config.json', cfg)
     os.environ['FOUNDRY_INTEGRATION_PROBE_CONFIG'] = str(out / 'worker_config.json')
     meta = {'args': vars(args), 'sequence': sequence, 'started': time.time(), 'status': 'initializing',
@@ -413,12 +506,19 @@ def main():
                    file_storage_path=str(out / 'sglang_storage'), crash_dump_folder=str(out / 'crash_dumps'),
                    cuda_graph_persistence=args.mode, cuda_graph_persistence_config=str(config), log_level='info')
     options.update(required_backend_options(args.target_backend))
+    if args.state_reference_bank:
+        options.update(enable_eplb=False,ep_num_redundant_experts=0,init_expert_location='trivial')
     meta['engine_args'] = options
     write_json(out / 'metadata.json', meta)
     engine, checks = None, []
     try:
         engine = Engine(**options)
         meta['resolved_engine_config'] = resolved_prefill_snapshot(engine)
+        if args.state_reference_bank:
+            resolved=engine.server_args.resolved_dict()
+            meta['bank_model_scope_flags']={k:resolved[k] for k in ('enable_eplb','ep_num_redundant_experts','init_expert_location')}
+            if meta['bank_model_scope_flags']!={'enable_eplb':False,'ep_num_redundant_experts':0,'init_expert_location':'trivial'}:
+                raise ValueError('Resolved routing configuration invalidates bank scope')
         write_json(out / 'metadata.json', meta)
         def generate(prompts, params, request_ids=None):
             if args.target_backend != 'deepep_dp':
@@ -434,15 +534,19 @@ def main():
             params = {'temperature':0,'max_new_tokens':args.generate_tokens,'ignore_eos':True}
             phase = {'armed':True,'id':index,'batch':batch,'global_batch':count}
             request_ids = ([f'foundry-b{batch}-p{index}-probe-{i}' for i in range(count)]
-                           if args.diagnostic_save_mismatch else None)
+                           if (args.diagnostic_save_mismatch or args.state_reference_bank) else None)
             if request_ids is not None:
                 phase['request_ids'] = request_ids
             write_json(phase_file, phase)
             actual = generation_ids(generate(prompts, params, request_ids))
             write_json(phase_file, {'armed':False})
             repeat_ids = ([f'foundry-b{batch}-p{index}-repeat-{i}' for i in range(count)]
-                          if args.diagnostic_save_mismatch else None)
+                          if (args.diagnostic_save_mismatch or args.state_reference_bank) else None)
+            if args.state_reference_bank and args.mode=='save':
+                # Existing second generation, not an additional model workload.
+                write_json(phase_file,{**phase,'request_ids':repeat_ids,'role':'repeat'})
             repeated = generation_ids(generate(prompts, params, repeat_ids))
+            write_json(phase_file, {'armed':False})
             covered = [(out / f'rank_{rank}' / f'phase_{index:04d}.json').exists() for rank in range(tp)]
             check = {'phase':phase,'tokens':actual,'repeated_tokens':repeated,'exact_match':actual == repeated,'rank_coverage':covered, 'input_ids':prompts}
             if args.save_reference:
@@ -460,6 +564,23 @@ def main():
             write_json(out/'generation_checks.json',checks)
             if (actual != repeated and not args.diagnostic_save_mismatch) or not all(covered):
                 raise RuntimeError(f'Generation mismatch/missing graph phase {index}')
+        if args.state_reference_bank:
+            from state_reference_bank import seal, verify_load_prefixes
+            if args.mode=='save':
+                import torch
+                meta['state_reference_bank']=seal(args.state_reference_bank,checks,bank_signature,
+                    manifest_groups(archive),tp,torch)
+            else:
+                for phase_index in range(len(sequence)):
+                    paths=[out/f'rank_{r}'/f'phase_{phase_index:04d}.json' for r in range(tp)]
+                    phase_reports=[json.loads(p.read_text()) for p in paths]
+                    verify_load_prefixes(phase_reports,checks)
+                    for path,report in zip(paths,phase_reports):
+                        report['cross_process_save_reference']['full_consumed_prefix_validation_pending']=False
+                        write_json(path,report)
+                meta['state_reference_bank']={'protocol':'foundry-per-request-prefix-bank-v1',
+                    'per_request_prefix_bitwise_agreement':True,'actual_complete_prefix_verified':True,
+                    'scope_assumption':bank_signature['scope_assumption']}
         aggregate = []
         for index in range(len(sequence)):
             reports = [json.loads((out/f'rank_{rank}'/f'phase_{index:04d}.json').read_text()) for rank in range(tp)]

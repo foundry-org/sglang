@@ -9,7 +9,7 @@ from backend_assertions import (BackendAssertions, _install_on_classes,
                                 _install_torch_distributed)
 
 
-def install(target):
+def install(target, strict_bank=False):
     import torch
     group = importlib.import_module('sglang.srt.distributed.parallel_state')
     symmem = importlib.import_module('sglang.srt.distributed.device_communicators.torch_symm_mem')
@@ -23,9 +23,22 @@ def install(target):
     _install_on_classes(state, torch, group.GroupCoordinator, symmem.TorchSymmMemCommunicator,
                         pynccl.PyNcclCommunicator, deep.Buffer if deep is not None else None)
     _install_torch_distributed(state, torch.distributed, group)
+    dispatch_capacities = []
+    if strict_bank and deep is not None:
+        dispatch_original = deep.Buffer.low_latency_dispatch
+        def dispatch(instance, *args, **kwargs):
+            hidden = args[0] if args else kwargs['x']
+            capacity = args[2] if len(args)>2 else kwargs['num_max_dispatch_tokens_per_rank']
+            row = {'tokens':int(hidden.shape[0]),'capacity':int(capacity)}
+            if row['tokens']>row['capacity']:
+                raise RuntimeError(f'DeepEP actual dispatch exceeds capacity: {row}')
+            if state._capturing(): dispatch_capacities.append(row)
+            return dispatch_original(instance,*args,**kwargs)
+        deep.Buffer.low_latency_dispatch = dispatch
     original = full.FullCudaGraphBackend.capture_one
     receipts = {}
     def capture(backend, shape_key, *args, **kwargs):
+        capacity_start = len(dispatch_capacities)
         before = [counter.copy() for counter in (state.counts, state.details, state.violations)]
         result = original(backend, shape_key, *args, **kwargs)
         graph = backend._graphs[shape_key]
@@ -36,6 +49,10 @@ def install(target):
                                   (state.counts, state.details, state.violations), before):
             receipt[name] = dict(sorted((now-old).items()))
         errors = state._errors(receipt['counts'], receipt['violations'])
+        if strict_bank and deep is not None:
+            receipt['low_latency_dispatch_capacities']=dispatch_capacities[capacity_start:]
+            if not receipt['low_latency_dispatch_capacities'] or any(c['capacity']<receipt['batch'] for c in receipt['low_latency_dispatch_capacities']):
+                errors.append('Missing/insufficient observed DeepEP dispatch capacity for bank scope')
         receipt['errors'] = errors
         receipts[id(graph)] = receipt
         return result
