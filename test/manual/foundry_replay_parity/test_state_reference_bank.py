@@ -119,4 +119,36 @@ class StateBankContracts(unittest.TestCase):
         self.generation['independent_save_exact_match']=False
         with self.assertRaises(ValueError):verify_load_prefixes([report],[self.generation])
 
+
+try:
+    import torch
+except ImportError:
+    torch=None
+
+@unittest.skipIf(torch is None,'CPU torch unavailable in local review interpreter')
+class StateBankTensorRoundTrip(unittest.TestCase):
+    def test_complete_tensor_bank_round_trip_and_corruption(self):
+        fixture=StateBankContracts();fixture.setUp()
+        phase=fixture.phase;generation={**fixture.generation,'phase':phase}
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)/'bank';root.mkdir();reference=Path(d)/'save';reference.mkdir()
+            (reference/'generation_checks.json').write_text(json.dumps([generation]))
+            logits=torch.zeros((2,40),dtype=torch.float32)
+            logits[0,31]=3;logits[1,21]=4
+            writer=Bank({'state_reference_bank':str(root),'mode':'save'},0,torch)
+            writer.save_frame(logits,fixture.inputs,[fixture.inputs],phase,9)
+            sig={'capture_batches':[2]}
+            seal(root,[generation],sig,[{'sha256':'archive'}],1,torch)
+            cfg={'state_reference_bank':str(root),'mode':'load','bank_signature':sig,'save_reference':str(reference)}
+            reader=Bank(cfg,0,torch)
+            restored,evidence=reader.lookup(fixture.inputs,[fixture.inputs],phase,2)
+            self.assertTrue(torch.equal(restored,logits))
+            self.assertTrue(evidence['global_logical_state_identity'])
+            self.assertFalse(evidence['actual_complete_prefix_verified'])
+            verify_load_prefixes([{'phase':phase,'rank':0,'state_reference_bank':evidence}],[generation])
+            self.assertTrue(evidence['actual_complete_prefix_verified'])
+            next((root/'rank_0').glob('*.pt')).write_bytes(b'corrupt')
+            with self.assertRaisesRegex(ValueError,'checksum'):
+                Bank(cfg,0,torch).lookup(fixture.inputs,[fixture.inputs],phase,2)
+
 if __name__=='__main__': unittest.main()

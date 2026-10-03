@@ -39,6 +39,11 @@ perform the actual execUpdate; `bank_deferred.jsonl` and each selected phase's
 `deferred_natural_replays` retain before/after Foundry states and receipt sequence
 numbers for transition audits. If no compatible state occurs, missing phase
 coverage fails the run.
+`bank_natural_replays.jsonl` additionally records every ordinary admission-skip
+(including unarmed boundaries), with both Foundry states, common admission
+offers, shape key and monotonically increasing replay index. The selected probe
+records its replay index. Use this complete timeline to catch updates occurring
+in non-target or transient unbalanced natural batches as well as explicit defers.
 
 Before timing, the selected actual replay is poisoned and its complete logits
 must equal the assembled reference bitwise on every rank. The existing strict

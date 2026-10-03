@@ -82,6 +82,7 @@ def install_worker_probe(rank):
     backend_observer = None
     bank = None
     deferred = []
+    natural_replays = []
     if cfg.get("state_reference_bank"):
         from state_reference_bank import Bank
         bank = Bank(cfg, rank, torch)
@@ -154,7 +155,19 @@ def install_worker_probe(rank):
                 global_inputs = [None] * world
                 torch.distributed.all_gather_object(global_inputs, bank_inputs, group=group)
             if decision['action'] == 'skip':
+                ordinary_before = None
+                if bank is not None and cfg['mode']=='load':
+                    from foundry import research_qmd
+                    ordinary_before = research_qmd.state(backend._graphs[key])
                 result = original(backend, key, batch, **kwargs)
+                if bank is not None and cfg['mode']=='load':
+                    record={'phase':phase,'replay_index':dp_replay_index-1,'kind':'admission_skip',
+                            'shape_key':repr(key),'admission':dp_admission,
+                            'foundry_before':ordinary_before,
+                            'foundry_after':research_qmd.state(backend._graphs[key])}
+                    natural_replays.append(record)
+                    with (out/'bank_natural_replays.jsonl').open('a') as f:
+                        f.write(json.dumps(record)+'\n')
                 if collect_bank:
                     bank.save_frame(result.next_token_logits, bank_inputs, global_inputs,
                                     offers[0]['phase'], dp_replay_index-1)
@@ -185,7 +198,11 @@ def install_worker_probe(rank):
                     record = {'phase':phase,'replay_index':dp_replay_index-1,'lookup_verdicts':lookups,
                               'bank_evidence':bank_evidence,'foundry_before':state_before,'foundry_after':after,
                               'scope':'ordinary unmeasured replay; phase remains unconsumed'}
+                    record.update(kind='reference_defer',shape_key=repr(key),admission=dp_admission)
                     deferred.append(record)
+                    natural_replays.append(record)
+                    with (out/'bank_natural_replays.jsonl').open('a') as f:
+                        f.write(json.dumps(record)+'\n')
                     with (out/'bank_deferred.jsonl').open('a') as f:
                         f.write(json.dumps(record)+'\n')
                     return result
@@ -235,6 +252,9 @@ def install_worker_probe(rank):
                     max_abs=float((cpu_reference.float()-bank_reference.float()).abs().max().item()))
                 report['state_reference_bank'] = bank_evidence
                 report['deferred_natural_replays'] = [r for r in deferred if r['phase']['id']==phase['id']]
+                report['unmeasured_natural_replays_before_probe'] = [r for r in natural_replays if r['phase'].get('id')==phase['id']]
+                report['natural_replay_timeline'] = f'rank_{rank}/bank_natural_replays.jsonl'
+                report['selected_replay_index'] = dp_replay_index-1
                 verdicts = [None] * world
                 torch.distributed.all_gather_object(verdicts,exact_bank,group=group)
                 report['cross_process_save_reference'] = {'protocol':bank_evidence['protocol'],
