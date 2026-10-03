@@ -6,7 +6,7 @@ It requires the companion Foundry research branch with `foundry.research_qmd` an
 
 ## What this test checks
 
-- Every SAVE capture batch receives a deterministic prompt set and a full first-decode logits reference. Prompts depend on the batch, not the order of the test phases.
+- Every SAVE capture batch receives a deterministic prompt set and a full selected-decode logits reference. Prompts depend on the batch, not the order of the test phases.
 - LOAD with `--save-reference` compares all logits and greedy generation tokens against that independent SAVE process. Outputs must match bitwise; no tolerance silently changes the criterion.
 - Each measured LOAD phase calls the real backend replay first, records the bridge state before and after it, and checks that a changed member has an actual update receipt. Same-member replays are explicitly distinguishable from switches.
 - A never-updated fresh exec is instantiated from the current target graph reconstructed by Foundry. The actual persistent candidate and fresh exec use the same instantiate flags, current inputs and output addresses. NaN poisoning and complete logits comparisons surround timing.
@@ -64,3 +64,9 @@ The preserved standalone protocol supplied `backend_assertions.py`, `dp_probe.py
 `--diagnostic-save-mismatch` preserves full actual/SAVE CPU logits, row-level differences and top-two margins, exact row-permutation evidence, and the live ForwardBatch / captured input-buffer values before replay. Requests receive deterministic IDs so live rows can be associated with submitted prompts. This helps distinguish a different selected decode position or request order from an execUpdate error.
 
 Only in this explicit mode may the run continue past a cross-process SAVE mismatch to collect a fresh-LOAD comparison and generated-token evidence. Candidate/fresh poison validation remains strictly bitwise. Cross-process and repeated-generation mismatches remain recorded, and the run always ends with `diagnostic_complete_not_accepted`, never `passed`; no performance acceptance is inferred. The default strict behavior is unchanged.
+
+### Observed DP reference-alignment limitation
+
+An actual DeepEP LOAD diagnostic selected rank 0 at decode position 65 and rank 1 at 64 for the same balanced batch. The earlier batch-only SAVE reference did not retain its live positions. Rank 0 then differed in raw logits even in the initial template phase with no execUpdate, while candidate/fresh were bitwise identical and all generated tokens matched independent SAVE. “First decode” in earlier descriptions must therefore mean first **eligible probe** replay, not necessarily each request's first decode step.
+
+A future independent raw-logit reference must use request identity plus decode position and prompt/prefix identity. The current diagnostic status remains unaccepted for independently aligned raw-logit correctness; within-state candidate/fresh and end-to-end token comparisons retain their separate meanings.
