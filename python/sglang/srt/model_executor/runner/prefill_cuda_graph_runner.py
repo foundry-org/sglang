@@ -145,6 +145,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.aiter import maybe_pre_warm_aiter_chip_info
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -1573,6 +1574,19 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
+        # Foundry CUDA graph persistence: SAVE archives the graphs captured by
+        # this loop, LOAD restores them in place of capturing (capture_one).
+        with get_foundry_adapter().capture_scope(
+            "prefill", model=self.model_runner.model, req_slots=self.capture_req_slots
+        ):
+            self._capture_graphs()
+
+    @property
+    def capture_req_slots(self) -> int:
+        """Fixed request-slot count of the captured prefill graphs."""
+        return self._capture_req_slots
+
+    def _capture_graphs(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
         self.warmup()
@@ -1585,7 +1599,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 ) as graph_capture_context:
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
+                        # Foundry SAVE warms every shape (private pool), then captures.
+                        get_foundry_adapter().run_capture_loop(
+                            self._capture_one_stream,
+                            model=self.model_runner.model,
+                            attn_backend=self.model_runner.attn_backend,
+                        )
         finally:
             dp_flags.capturing_prefill_graph = False
         if dp_flags.prefill_graph_has_dp_gather:
