@@ -6008,6 +6008,7 @@ def run_scheduler_process(
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
+    # [STARTUP-OPT-2] Freeze the import heap before the Scheduler is built.
     # The heap here is imports and configs, none of it garbage. Freezing it keeps
     # the full collections on the startup path (memory profiling, graph capture)
     # from re-scanning it (~0.3 s each on a 14B model).

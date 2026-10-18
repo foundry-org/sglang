@@ -540,7 +540,7 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
-        # Per-wrapper-index int workspace pair shared by the per-bs CUDA-graph
+        # [STARTUP-OPT-4] Per-wrapper-index int workspace pair shared by the per-bs CUDA-graph
         # decode wrappers (see _share_decode_int_workspace). Not with spec
         # decoding: its plan-stream pre-plan may run ahead of the replay.
         self._share_decode_int_ws = model_runner.spec_algorithm.is_none()
@@ -1122,6 +1122,7 @@ class FlashInferAttnBackend(AttentionBackend):
         return wrappers
 
     def _share_decode_int_workspace(self, wrappers: list) -> None:
+        # [STARTUP-OPT-4] Shared flashinfer decode workspace.
         # Every flashinfer decode wrapper allocates its own 8 MiB device int
         # workspace and 8 MiB pinned staging buffer; one wrapper set per
         # captured bs makes that 2 x 8 MiB x #bs and a cudaHostAlloc per bs.

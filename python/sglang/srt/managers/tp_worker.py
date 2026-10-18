@@ -298,6 +298,7 @@ class TpModelWorker(BaseTpWorker):
         self._processor, self._tokenizer_pending = value, False
 
     def _load_tokenizer(self) -> None:
+        # [STARTUP-OPT-1] see __init__.
         # A draft worker's tokenizer would only duplicate the target's:
         # tokenizer_path always points at the target model.
         if not self._tokenizer_pending:
@@ -365,8 +366,9 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        # Loaded on first use: only speculative workers read it, and loading it
-        # here sat on the startup path between the weight load and the KV pool.
+        # [STARTUP-OPT-1] Lazy worker tokenizer. Loaded on first use: only
+        # speculative workers read it, and loading it here sat on the startup
+        # path between the weight load and the KV pool (~1.1 s on Qwen3-14B).
         self._tokenizer = self._processor = None
         self._tokenizer_pending = not (
             get_serving().skip_tokenizer_init or self.is_draft_worker
