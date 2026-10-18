@@ -540,6 +540,11 @@ class FlashInferAttnBackend(AttentionBackend):
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
 
         self.decode_cuda_graph_metadata = {}
+        # Per-wrapper-index int workspace pair shared by the per-bs CUDA-graph
+        # decode wrappers (see _share_decode_int_workspace). Not with spec
+        # decoding: its plan-stream pre-plan may run ahead of the replay.
+        self._share_decode_int_ws = model_runner.spec_algorithm.is_none()
+        self._shared_decode_int_ws: Optional[list] = None
         self.prefill_cuda_graph_metadata = {}  # For verify
         self.draft_extend_cuda_graph_metadata = {}  # For draft extend
         # Plain EXTEND under full prefill CUDA graph: one wrapper set
@@ -1100,7 +1105,7 @@ class FlashInferAttnBackend(AttentionBackend):
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
-        return [
+        wrappers = [
             BatchDecodeWithPagedKVCacheWrapper(
                 self.workspace_buffer,
                 "NHD",
@@ -1113,6 +1118,31 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             for i in range(self.num_wrappers)
         ]
+        self._share_decode_int_workspace(wrappers)
+        return wrappers
+
+    def _share_decode_int_workspace(self, wrappers: list) -> None:
+        # Every flashinfer decode wrapper allocates its own 8 MiB device int
+        # workspace and 8 MiB pinned staging buffer; one wrapper set per
+        # captured bs makes that 2 x 8 MiB x #bs and a cudaHostAlloc per bs.
+        # The decode replay path always re-plans the bs's wrappers right before
+        # its graph replays on the same stream (init_forward_metadata_out_graph
+        # -> plan(): host fill of the pinned buffer + async H2D into the int
+        # workspace), so graphs of different bs can share the pair of the same
+        # wrapper index, as consecutive steps of one bs already do. Dropping the
+        # wrapper's own pair at once lets the caching allocators hand the same
+        # blocks to the next construction, so later wrappers allocate nothing.
+        if not self._share_decode_int_ws:
+            return
+        if self._shared_decode_int_ws is None:
+            self._shared_decode_int_ws = [
+                (w._int_workspace_buffer, w._pin_memory_int_workspace_buffer)
+                for w in wrappers
+            ]
+            return
+        for w, (int_ws, pinned_ws) in zip(wrappers, self._shared_decode_int_ws):
+            w._int_workspace_buffer = int_ws
+            w._pin_memory_int_workspace_buffer = pinned_ws
 
     def get_cuda_graph_decode_wrappers(
         self,
