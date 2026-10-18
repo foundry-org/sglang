@@ -57,8 +57,10 @@ def freeze_gc(enable_cudagraph_gc: bool):
         yield
     finally:
         if should_freeze:
-            gc.unfreeze()
+            # Stay frozen: unfreezing would make the next collection re-scan the
+            # whole heap, and the post-warmup freeze_gc freezes it again anyway.
             gc.collect()
+            gc.freeze()
 
 
 def get_batch_sizes_to_capture(

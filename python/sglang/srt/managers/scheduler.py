@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import gc
 import logging
 import math
 import os
@@ -6006,6 +6007,11 @@ def run_scheduler_process(
         elif get_disagg().disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
+
+    # The heap here is imports and configs, none of it garbage. Freezing it keeps
+    # the full collections on the startup path (memory profiling, graph capture)
+    # from re-scanning it (~0.3 s each on a 14B model).
+    gc.freeze()
 
     # Create a scheduler and run the event loop
     scheduler = None
