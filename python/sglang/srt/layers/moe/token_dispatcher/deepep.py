@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import logging
 import os
+import time
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -301,7 +302,12 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
+        _t0 = time.time()
         state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
+        print(
+            f"[deepep-init] rank={dist.get_rank()} pid={os.getpid()} t_begin={_t0:.3f} wall_ms={(time.time() - _t0) * 1000:.1f}",
+            flush=True,
+        )  # [STARTUP-MEAS] DeepEP buffer construction time (eager engines pay it on the first request)
         return state.buffer
 
     @classmethod

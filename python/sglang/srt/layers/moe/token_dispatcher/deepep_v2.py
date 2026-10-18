@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import NamedTuple, Optional
 
 import torch
@@ -188,6 +189,7 @@ class DeepEPv2Buffer:
 
         # Communicator reuse requires a device-bound process group.
         os.environ.setdefault("EP_REUSE_NCCL_COMM", "0")
+        _t0 = time.time()
         buffer = ElasticBuffer(
             group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
@@ -198,6 +200,10 @@ class DeepEPv2Buffer:
             sl_idx=0,
             prefer_overlap_with_compute=False,
         )
+        print(
+            f"[deepep-init] rank={dist.get_rank()} pid={os.getpid()} t_begin={_t0:.3f} wall_ms={(time.time() - _t0) * 1000:.1f}",
+            flush=True,
+        )  # [STARTUP-MEAS] DeepEP buffer construction time (eager engines pay it on the first request)
         # Publish only after collective construction succeeds.
         state.buffer = buffer
         state.key = key
