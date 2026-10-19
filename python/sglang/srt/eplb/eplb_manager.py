@@ -93,8 +93,12 @@ class EPLBManager:
 
             yield from self.rebalance()
 
-    def rebalance(self):
+    def rebalance(self, *, restore_trivial: bool = False):
         if self._rebalance_disabled_reason is not None:
+            if restore_trivial:
+                raise RuntimeError(
+                    "Cannot restore recovery layout while EPLB is disabled"
+                )
             if not self._rebalance_disabled_logged:
                 logger.debug(
                     "[EPLBManager] rebalance disabled: %s",
@@ -105,6 +109,10 @@ class EPLBManager:
 
         elastic_state = ElasticEPStateManager.instance()
         is_post_scale_rebalance = elastic_state is not None and elastic_state.has_scaled
+        if restore_trivial and is_post_scale_rebalance:
+            raise RuntimeError(
+                "Trivial recovery layout is only supported for the original rank world"
+            )
         # A failed later scale leaves the previously committed world serving.
         if is_post_scale_rebalance and (
             elastic_state.pending_ep_size is not None
@@ -120,23 +128,31 @@ class EPLBManager:
             torch.get_device_module().synchronize()
             time_start = time.time()
 
-        dump_record_output = get_global_expert_distribution_recorder().dump_record(
-            output_mode="object"
-        )
-        logical_count = dump_record_output["logical_count"]
-        average_utilization_rate_over_window = dump_record_output[
-            "average_utilization_rate_over_window"
-        ]
+        if restore_trivial:
+            # Same allocator as initial model construction. Skip utilization-based
+            # admission: restoring every recovered rank is required at this boundary.
+            expert_location_metadata = ExpertLocationMetadata.init_trivial(
+                self._model_config, moe_ep_rank=self._elastic_global_rank()
+            )
+            if expert_location_metadata is None:
+                raise RuntimeError("Model has no trivial expert layout to restore")
+        else:
+            dump_record_output = get_global_expert_distribution_recorder().dump_record(
+                output_mode="object"
+            )
+            logical_count = dump_record_output["logical_count"]
+            average_utilization_rate_over_window = dump_record_output[
+                "average_utilization_rate_over_window"
+            ]
 
-        # Check whether rebalancing is needed
-        if not self._check_rebalance_needed(average_utilization_rate_over_window):
-            return
+            # Check whether rebalancing is needed
+            if not self._check_rebalance_needed(average_utilization_rate_over_window):
+                return
 
-        expert_location_metadata = self._compute_expert_location_metadata(
-            logical_count,
-            broadcast_over_world=is_post_scale_rebalance,
-        )
-
+            expert_location_metadata = self._compute_expert_location_metadata(
+                logical_count,
+                broadcast_over_world=is_post_scale_rebalance,
+            )
         from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
             init_lplb_solvers,
         )

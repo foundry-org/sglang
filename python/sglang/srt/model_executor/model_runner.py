@@ -41,6 +41,7 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    ensure_mooncake_ep_buffer,
     get_healthy_expert_location_src_rank,
     get_scale_cohort,
     join_process_groups,
@@ -48,6 +49,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     maybe_rebalance_after_rank_fault,
     maybe_recover_ep_ranks,
     register_scale_cohort,
+    schedule_post_recovery_rebalance,
     try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
@@ -1037,6 +1039,7 @@ class ModelRunner:
                 )
 
     def post_capture_elastic_ep_recover(self):
+        ensure_mooncake_ep_buffer(self.model)
         join_process_groups()
 
         global_ep_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
@@ -1055,6 +1058,7 @@ class ModelRunner:
         )
 
         ElasticEPStateManager.instance().reset()
+        schedule_post_recovery_rebalance(self.eplb_manager)
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""
@@ -2465,7 +2469,9 @@ class ModelRunner:
         reinit_attn_backend: bool,
         split_forward_count: int,
     ) -> ModelRunnerOutput:
-        if maybe_rebalance_after_rank_fault(eplb_manager=self.eplb_manager):
+        if maybe_rebalance_after_rank_fault(
+            eplb_manager=self.eplb_manager, tp_group=get_parallel().tp_group
+        ):
             output = self._forward_raw(
                 forward_batch,
                 pp_proxy_tensors,

@@ -149,7 +149,14 @@ def _update_expert_weights_raw(
         routed_experts_weights_of_layer[update_layer_ids[0]]
     )
 
-    world_size = torch.distributed.get_world_size()
+    # Elastic PG size counts live members after a fault. Expert slots still use
+    # the full rank space: using live size here changes node boundaries (and
+    # gives zero GPUs/node for EP2 -> one survivor on two logical nodes).
+    world_size = (
+        old_expert_location_metadata.ep_size
+        if ElasticEPStateManager.instance() is not None
+        else torch.distributed.get_world_size()
+    )
     num_local_physical_experts = old_expert_location_metadata.num_local_physical_experts
     num_gpu_per_node = world_size // nnodes
 

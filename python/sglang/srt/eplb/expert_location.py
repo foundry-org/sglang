@@ -516,17 +516,27 @@ def broadcast_global_expert_location_metadata(
     metadata = get_global_expert_location_metadata()
     assert metadata is not None
 
-    metadata.physical_to_logical_map = metadata.physical_to_logical_map.contiguous()
-    torch.distributed.broadcast(
-        metadata.physical_to_logical_map, src=src_rank, group=group
-    )
-    metadata = ExpertLocationMetadata.init_by_mapping(
+    broadcast_map = metadata.physical_to_logical_map.contiguous()
+    torch.distributed.broadcast(broadcast_map, src=src_rank, group=group)
+    new_metadata = ExpertLocationMetadata.init_by_mapping(
         model_config,
-        metadata.physical_to_logical_map,
+        broadcast_map,
         moe_ep_rank=moe_ep_rank,
     )
-    set_global_expert_location_metadata(metadata, allow_overwrite=True)
-    return metadata
+    # Recovery keeps the expert-slot geometry. Graphs and dispatch views retain
+    # these tensor addresses, so replacing the object would leave stale maps
+    # after a subsequent EPLB update. Scale-up may change the geometry and keeps
+    # its existing replacement path.
+    if (
+        metadata.ep_size == new_metadata.ep_size
+        and metadata.num_physical_experts == new_metadata.num_physical_experts
+        and metadata.num_layers == new_metadata.num_layers
+        and metadata.num_logical_experts == new_metadata.num_logical_experts
+    ):
+        metadata.update(new_metadata, update_layer_ids=list(range(metadata.num_layers)))
+        return metadata
+    set_global_expert_location_metadata(new_metadata, allow_overwrite=True)
+    return new_metadata
 
 
 def _compute_logical_to_all_physical_map(

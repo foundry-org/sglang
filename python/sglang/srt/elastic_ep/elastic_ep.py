@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
@@ -10,7 +13,10 @@ import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
-from sglang.srt.eplb.expert_location import broadcast_global_expert_location_metadata
+from sglang.srt.eplb.expert_location import (
+    broadcast_global_expert_location_metadata,
+    get_global_expert_location_metadata,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -446,6 +452,119 @@ def join_scale_process_group() -> None:
     _refresh_ep_members()
 
 
+def ensure_mooncake_ep_buffer(model) -> bool:
+    """Create lazy eager EP state before the membership IPC all-gather.
+
+    Opt-in recovery recipes use this alongside post-recovery layout repair.
+    Captured/Foundry paths already own a buffer and do not allocate another one.
+    """
+    if os.environ.get("SGLANG_ELASTIC_REBALANCE_AFTER_RECOVER", "0") not in (
+        "1",
+        "true",
+    ):
+        return False
+    if get_exec().moe.elastic_ep_backend != "mooncake":
+        return False
+    from sglang.srt.layers.moe.token_dispatcher.mooncake import (
+        EPBuffer,
+        MooncakeEPDispatcher,
+    )
+
+    if EPBuffer.get_existing_buffer() is not None:
+        return True
+    for module in model.modules():
+        dispatcher = getattr(module, "dispatcher", None)
+        if dispatcher is None:
+            continue
+        for candidate in (dispatcher, *getattr(dispatcher, "_inners", [])):
+            if isinstance(candidate, MooncakeEPDispatcher):
+                impl = getattr(candidate, "_low_latency_dispatcher", None)
+                if impl is not None:
+                    impl._get_buffer()
+                    if EPBuffer.get_existing_buffer() is None:
+                        raise RuntimeError(
+                            "Mooncake dispatcher did not create its recovery EP buffer"
+                        )
+                    logger.info(
+                        "[Elastic EP] created the mooncake EP buffer before joining"
+                    )
+                    return True
+    raise RuntimeError(
+        "Mooncake recovery requires an EP dispatcher buffer before membership join"
+    )
+
+
+def _recovery_layout_summary(layout: str) -> dict:
+    """One-time evidence of installed slots and this rank's actual dispatch map."""
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        raise RuntimeError("Recovery layout metadata is missing")
+    mapping = metadata.physical_to_logical_map_cpu.tolist()
+    ep_size = metadata.ep_size
+    local_slots = metadata.num_local_physical_experts
+    slots_by_rank = [
+        sum(
+            value >= 0
+            for layer in mapping
+            for value in layer[rank * local_slots : (rank + 1) * local_slots]
+        )
+        for rank in range(ep_size)
+    ]
+    dispatch = metadata.logical_to_rank_dispatch_physical_map
+    dispatch_by_rank = None
+    if dispatch is not None:
+        dispatch_by_rank = [0] * ep_size
+        for layer in dispatch.detach().cpu().tolist():
+            for physical_slot in layer:
+                if not 0 <= physical_slot < ep_size * local_slots:
+                    raise RuntimeError(
+                        "Recovery dispatch map references an invalid expert slot"
+                    )
+                dispatch_by_rank[physical_slot // local_slots] += 1
+    return dict(
+        layout=layout,
+        tp_rank=get_parallel().tp_rank + get_parallel().ep_join_rank_offset,
+        ep_size=ep_size,
+        physical_slots_per_rank=local_slots,
+        populated_slots_across_layers_by_rank=slots_by_rank,
+        ranks_with_experts=[rank for rank, count in enumerate(slots_by_rank) if count],
+        dispatch_entries_by_rank=dispatch_by_rank,
+        physical_mapping_sha256=hashlib.sha256(
+            json.dumps(mapping, separators=(",", ":")).encode()
+        ).hexdigest(),
+    )
+
+
+def schedule_post_recovery_rebalance(eplb_manager) -> None:
+    """Opt-in collective layout restoration on survivors AND recovered ranks."""
+    if os.environ.get("SGLANG_ELASTIC_REBALANCE_AFTER_RECOVER", "0") not in (
+        "1",
+        "true",
+    ):
+        return
+    layout = os.environ.get("SGLANG_ELASTIC_POST_RECOVERY_LAYOUT", "trivial")
+    if layout not in ("trivial", "eplb"):
+        raise ValueError(f"Unsupported post-recovery expert layout: {layout}")
+    if eplb_manager is None:
+        raise RuntimeError("Post-recovery expert layout requires EPLB")
+    logger.info("[Elastic EP] post-recovery EPLB rebalance (layout=%s)", layout)
+    started = time.perf_counter()
+    for _ in eplb_manager.rebalance(restore_trivial=layout == "trivial"):
+        pass
+    # P2P completion alone does not synchronize ranks that have no expert moves.
+    # All recovered workers must install their metadata before service is ready.
+    torch.distributed.barrier()
+    eplb_manager.reset_generator()
+    summary = _recovery_layout_summary(layout)
+    logger.info(
+        "[Elastic EP] post-recovery EPLB rebalance done in %.3f s",
+        time.perf_counter() - started,
+    )
+    logger.info(
+        "[Elastic EP] recovery layout ready %s", json.dumps(summary, sort_keys=True)
+    )
+
+
 def join_process_groups() -> None:
     """Rejoin WORLD and every launch-time parallel group after recovery."""
     from mooncake.pg import join_group
@@ -520,16 +639,100 @@ def maybe_recover_ep_ranks(
             ),
         )
         ElasticEPStateManager.instance().reset()
+        if os.environ.get("SGLANG_ELASTIC_REBALANCE_AFTER_RECOVER", "0") in (
+            "1",
+            "true",
+        ):
+            logger.info(f"recover ranks {ranks_to_recover} membership restored")
+        schedule_post_recovery_rebalance(eplb_manager)
         logger.info(f"recover ranks {ranks_to_recover} done")
         return True
 
     return False
 
 
-def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+def _wait_for_pg_fault_membership(elastic_ep_state, tp_group) -> None:
+    """Recipe-only gate: do not move experts against stale PG membership.
+
+    EP kernels and PG have separate active masks. Activation-ready peer state
+    is not a substitute for the authoritative CPU/device group masks here.
+    """
+    from fault_timing import get_config
+
+    if tp_group is None:
+        raise RuntimeError("EEP PG fault gate requires the TP group")
+    config = get_config()
+    timeout_s = (
+        2
+        * (
+            config["pg_fault_window_us"]
+            + max(config["pg_collective_timeout_us"], config["pg_p2p_timeout_us"])
+        )
+        / 1_000_000
+    )
+    current = [bool(x) for x in elastic_ep_state.active_ranks.detach().cpu().tolist()]
+    previous = [
+        bool(x) for x in elastic_ep_state.last_active_ranks.detach().cpu().tolist()
+    ]
+    if len(previous) != len(current):
+        raise RuntimeError("EEP PG fault gate: EP mask shape changed")
+    newly_dead = [
+        i for i, (old, new) in enumerate(zip(previous, current)) if old and not new
+    ]
+    if not newly_dead:
+        return
+    local_rank = tp_group.rank_in_group
+    if not 0 <= local_rank < len(current):
+        raise RuntimeError("EEP PG fault gate: invalid local group rank")
+    started = time.monotonic()
+    logger.info(
+        "[Elastic EP] PG fault gate begin dead=%s timeout_s=%.3f",
+        newly_dead,
+        timeout_s,
+    )
+    while True:
+        device = [bool(x) for x in tp_group.active_ranks.detach().cpu().tolist()]
+        cpu = [bool(x) for x in tp_group.active_ranks_cpu.detach().cpu().tolist()]
+        if len(device) != len(current) or len(cpu) != len(current):
+            raise RuntimeError("EEP PG fault gate: PG/EP mask shape mismatch")
+        if not (device[local_rank] and cpu[local_rank]):
+            raise RuntimeError(
+                f"EEP PG fault gate: PG removed this process's rank {local_rank}; "
+                "refusing expert movement from an inactive member"
+            )
+        elapsed = time.monotonic() - started
+        if device == cpu and all(not device[i] for i in newly_dead):
+            # PG can observe the second failed rank before EP does. Merge only
+            # removals into the existing tensor; graph-held pointers stay valid
+            # and this fault path never activates a reserved/rejoining slot.
+            extra_dead = [
+                i for i, alive in enumerate(current) if alive and not device[i]
+            ]
+            for rank in extra_dead:
+                elastic_ep_state.active_ranks[rank] = 0
+            logger.info(
+                "[Elastic EP] PG fault gate end dead=%s additional_dead=%s duration_s=%.6f",
+                newly_dead,
+                extra_dead,
+                elapsed,
+            )
+            return
+        if elapsed >= timeout_s:
+            raise TimeoutError(
+                f"EEP PG fault gate timed out after {elapsed:.3f}s: dead={newly_dead} "
+                f"device={device} cpu={cpu}; refusing expert movement"
+            )
+        time.sleep(min(0.1, timeout_s - elapsed))
+
+
+def maybe_rebalance_after_rank_fault(
+    *, eplb_manager: EPLBManager, tp_group=None
+) -> bool:
     elastic_ep_state = ElasticEPStateManager.instance()
     if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
         return False
+    if os.environ.get("EEP_FAULT_TIMING") == "1":
+        _wait_for_pg_fault_membership(elastic_ep_state, tp_group)
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
     logger.info("EPLB due to rank faults")

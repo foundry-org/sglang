@@ -722,6 +722,11 @@ class FusedMoE(torch.nn.Module):
                 expert_data=expert_data,
             )
 
+    def _copy_expert_weight(self, target, source):
+        # Recovery experiments may scope an alternative copy policy to loading.
+        # Keep expert mapping, slicing and parameter allocation in this loader.
+        return target.copy_(source)
+
     def _load_w13(
         self,
         expert_data: torch.Tensor,
@@ -799,11 +804,12 @@ class FusedMoE(torch.nn.Module):
             and shard_dim < expert_data.dim()
             and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
         ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
+            self._copy_expert_weight(
+                expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]),
+                loaded_weight,
             )
         else:
-            expert_data.copy_(loaded_weight)
+            self._copy_expert_weight(expert_data, loaded_weight)
 
     def _load_w2(
         self,
@@ -883,11 +889,12 @@ class FusedMoE(torch.nn.Module):
             and shard_dim < expert_data.dim()
             and loaded_weight.shape[shard_dim] < expert_data.shape[shard_dim]
         ):
-            expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]).copy_(
-                loaded_weight
+            self._copy_expert_weight(
+                expert_data.narrow(shard_dim, 0, loaded_weight.shape[shard_dim]),
+                loaded_weight,
             )
         else:
-            expert_data.copy_(loaded_weight)
+            self._copy_expert_weight(expert_data, loaded_weight)
 
     def _maybe_load_fp8_shared_expert_as_fp4(
         self,
