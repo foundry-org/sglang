@@ -416,23 +416,27 @@ def _install_import_time_cuda_shim() -> None:
         return
     for name in ("get_device_capability", "get_device_properties", "current_device"):
         _TORCH_CUDA_ORIG[name] = getattr(torch.cuda, name)
+    # Closures hold their own references: triton's jit driver keeps the shim it
+    # saw at import, and it must keep working after run() restores torch.cuda
+    # and clears the registry.
+    real = dict(_TORCH_CUDA_ORIG)
 
     def get_device_capability(device=None):
         if torch.cuda.is_initialized():
-            return _TORCH_CUDA_ORIG["get_device_capability"](device)
+            return real["get_device_capability"](device)
         idx = device if isinstance(device, int) else 0
         major, minor, *_ = _nvml_device(idx)
         return (major, minor)
 
     def get_device_properties(device=None):
         if torch.cuda.is_initialized():
-            return _TORCH_CUDA_ORIG["get_device_properties"](device)
+            return real["get_device_properties"](device)
         idx = device if isinstance(device, int) else 0
         return _NvmlDeviceProperties(idx)
 
     def current_device():
         if torch.cuda.is_initialized():
-            return _TORCH_CUDA_ORIG["current_device"]()
+            return real["current_device"]()
         return 0
 
     torch.cuda.get_device_capability = get_device_capability
