@@ -1222,6 +1222,9 @@ class Envs:
     SGLANG_LOG_EXPERT_LOCATION_METADATA = EnvBool(False)
     SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR = EnvStr("/tmp")
     SGLANG_EPLB_HEATMAP_COLLECTION_INTERVAL = EnvInt(0)
+    # Elastic EP staged recovery, e.g. "1|2,3": survivors recover the first rank group
+    # whose ranks are all dead, then the next one; empty = all dead ranks at once.
+    SGLANG_ELASTIC_RECOVER_STAGES = EnvStr("")
     # Chunk size for the rebalance expert-weight P2P exchange; set
     # >= num_physical_experts to submit a single batch_isend_irecv.
     SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE = EnvIntWithAlias(

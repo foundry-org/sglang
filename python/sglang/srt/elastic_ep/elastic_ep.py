@@ -13,6 +13,7 @@ import torch
 
 from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.utils import get_global_tcp_store
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import (
     broadcast_global_expert_location_metadata,
     get_global_expert_location_metadata,
@@ -93,8 +94,55 @@ class ElasticEPState:
             # Reserved slots stay inactive until their ranks join.
             self.active_ranks.zero_()
             self.active_ranks[: self.effective_ep_size] = 1
+            if recover_stages():
+                # Staged recovery: ranks of a later stage are still dead; keep them
+                # inactive (PG membership) instead of assuming the whole world rejoined.
+                pg = _pg_active_mask()
+                if pg is not None:
+                    n = min(len(pg), self.active_ranks.numel())
+                    self.active_ranks[:n] &= pg[:n].to(
+                        device=self.active_ranks.device, dtype=self.active_ranks.dtype
+                    )
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+
+
+def recover_stages() -> List[List[int]]:
+    """SGLANG_ELASTIC_RECOVER_STAGES="1|2,3": recover these rank groups one at a time.
+
+    Recipe-only (staged restart of several killed nodes). Unset = recover every
+    inactive rank at once (the default all-or-nothing behaviour).
+    """
+    spec = (envs.SGLANG_ELASTIC_RECOVER_STAGES.get() or "").strip()
+    if not spec:
+        return []
+    return [
+        sorted({int(x) for x in group.split(",") if x.strip()})
+        for group in spec.split("|")
+        if group.strip()
+    ]
+
+
+def _staged_recover_subset(inactive: List[int]) -> List[int]:
+    """First configured stage whose ranks are all inactive; else every inactive rank."""
+    stages = recover_stages()
+    if not stages:
+        return inactive
+    dead = set(inactive)
+    for ranks in stages:
+        if ranks and set(ranks) <= dead:
+            return ranks
+    return inactive
+
+
+def _pg_active_mask() -> Optional[torch.Tensor]:
+    try:
+        tp_group = get_parallel().tp_group
+        dev = tp_group.active_ranks.detach().cpu().bool()
+        cpu = tp_group.active_ranks_cpu.detach().cpu().bool()
+    except Exception:  # noqa: BLE001
+        return None
+    return dev & cpu
 
 
 class ElasticEPStateManager:
@@ -547,9 +595,23 @@ def schedule_post_recovery_rebalance(eplb_manager) -> None:
         raise ValueError(f"Unsupported post-recovery expert layout: {layout}")
     if eplb_manager is None:
         raise RuntimeError("Post-recovery expert layout requires EPLB")
+    restore_trivial = layout == "trivial"
+    state = ElasticEPStateManager.instance()
+    if (
+        restore_trivial
+        and recover_stages()
+        and state is not None
+        and state.active_ranks is not None
+        and not bool(state.active_ranks[: state.effective_ep_size].all())
+    ):
+        # Staged recovery, later stages still dead: the trivial layout would place
+        # experts on dead ranks. Rebalance over the active ranks instead (the same
+        # elasticity-aware EPLB as the fault path; its inputs are all-reduced).
+        restore_trivial = False
+        layout = "eplb-active"
     logger.info("[Elastic EP] post-recovery EPLB rebalance (layout=%s)", layout)
     started = time.perf_counter()
-    for _ in eplb_manager.rebalance(restore_trivial=layout == "trivial"):
+    for _ in eplb_manager.rebalance(restore_trivial=restore_trivial):
         pass
     # P2P completion alone does not synchronize ranks that have no expert moves.
     # All recovered workers must install their metadata before service is ready.
@@ -624,6 +686,7 @@ def maybe_recover_ep_ranks(
     ranks_to_recover = [
         i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
     ]
+    ranks_to_recover = _staged_recover_subset(ranks_to_recover)
 
     # try_recover_ranks polls peer state via Mooncake EP backend.
     # Mooncake's internal semantics guarantee that all ranks observe

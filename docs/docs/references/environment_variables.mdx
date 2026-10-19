@@ -1843,6 +1843,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log metrics from the expert-location updater.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ELASTIC_RECOVER_STAGES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Elastic EP staged recovery: rank groups recovered one at a time, e.g. <code>1|2,3</code>. Survivors recover the first group whose ranks are all dead; still-dead ranks stay inactive and the post-recovery layout is rebalanced over the active ranks until the world is complete. Empty recovers every dead rank at once.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
   </tbody>
 </table>
 
