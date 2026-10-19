@@ -298,6 +298,9 @@ class Envs:
     # Address file of a long-lived forkserver daemon; a launcher with
     # SGLANG_EARLY_FORKSERVER=1 attaches when the file names a live one.
     SGLANG_FORKSERVER_FILE = EnvStr("/tmp/sglang_forkserver.json")
+    # The forkserver (or daemon) was started with Foundry's CUDA hook in
+    # LD_PRELOAD: keep forked workers under --cuda-graph-persistence.
+    SGLANG_FORKSERVER_ALLOW_FOUNDRY = EnvBool(False)
     # multiprocessing start method the launcher applies: spawn | forkserver.
     # Set by start_early(); not meant to be set by hand.
     SGLANG_MP_START_METHOD = EnvStr("spawn")

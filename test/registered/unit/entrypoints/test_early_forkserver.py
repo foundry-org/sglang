@@ -26,6 +26,7 @@ import torch
 from sglang.srt.entrypoints import early_forkserver
 from sglang.srt.entrypoints.early_forkserver import (
     merge_launcher_env,
+    missing_preloads,
     read_daemon_info,
     sync_offline_flags,
 )
@@ -68,6 +69,42 @@ class TestMergeLauncherEnv(CustomTestCase):
             server_initial={"PATH": "/bin"},
         )
         self.assertEqual(merged["HF_HUB_OFFLINE"], "1")
+
+
+class TestMissingPreloads(CustomTestCase):
+    """A forked worker holds the libraries its forkserver was exec'd with; a
+    library the launcher preloads for its workers (Foundry's CUDA hook) that
+    the forkserver lacks must be reported, not silently dropped."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.hook = os.path.join(tmp.name, "libhook.so")
+        self.other = os.path.join(tmp.name, "libother.so")
+        for path in (self.hook, self.other):
+            open(path, "w").close()
+
+    def test_mapped_library_is_not_reported(self):
+        self.assertEqual(missing_preloads(self.hook, [self.hook]), [])
+
+    def test_unmapped_library_is_reported(self):
+        self.assertEqual(
+            missing_preloads(f"{self.hook}:{self.other}", [self.other]), [self.hook]
+        )
+
+    def test_space_separated_entries(self):
+        self.assertEqual(
+            missing_preloads(f"{self.hook} {self.other}", []), [self.hook, self.other]
+        )
+
+    def test_symlinked_path_matches_the_mapped_file(self):
+        link = self.hook + ".link"
+        os.symlink(self.hook, link)
+        self.assertEqual(missing_preloads(link, [self.hook]), [])
+
+    def test_bare_names_and_missing_files_are_skipped(self):
+        """ld.so ignores (with a warning) what it cannot open, under spawn too."""
+        self.assertEqual(missing_preloads("libjemalloc.so:/nonexistent/lib.so", []), [])
 
 
 class TestSyncOfflineFlags(CustomTestCase):

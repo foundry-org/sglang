@@ -25,7 +25,7 @@ parent process.
 import multiprocessing as mp
 import multiprocessing.process as mpp
 import os
-from typing import Dict, Mapping, Optional
+from typing import Dict, Iterable, List, Mapping, Optional
 
 from sglang.srt.environ import envs
 
@@ -203,6 +203,8 @@ def _install_process_patches() -> None:
             os.environ.clear()
             os.environ.update(merged)
         _adopt_stdio(getattr(self, _STDIO_ATTR, None))
+        if env:
+            _check_preloads(env.get("LD_PRELOAD", ""))
         _restore_torch_cuda()
         _reuse_forkserver()
         _sync_offline_flags()
@@ -227,6 +229,42 @@ def merge_launcher_env(
     }
     merged.update(launcher)
     return merged
+
+
+def missing_preloads(ld_preload: str, mapped: Iterable[str]) -> List[str]:
+    """Entries of the launcher's LD_PRELOAD (paths to existing files) that are
+    not mapped into this process. ld.so applies LD_PRELOAD at exec, so a forked
+    child holds the libraries its forkserver was started with, not these."""
+    mapped = {os.path.realpath(path) for path in mapped}
+    return [
+        entry
+        for entry in ld_preload.replace(" ", ":").split(":")
+        if "/" in entry
+        and os.path.isfile(entry)
+        and os.path.realpath(entry) not in mapped
+    ]
+
+
+def _check_preloads(ld_preload: str) -> None:
+    """Child side: a library the launcher preloads for its workers (Foundry's
+    CUDA hook) must already be in the forkserver; fail instead of running
+    without it."""
+    if not ld_preload:
+        return
+    try:
+        with open("/proc/self/maps") as f:
+            fields = [line.split(None, 5) for line in f]
+    except OSError:
+        return
+    mapped = [f[5].strip() for f in fields if len(f) == 6 and f[5].startswith("/")]
+    missing = missing_preloads(ld_preload, mapped)
+    if missing:
+        raise RuntimeError(
+            f"LD_PRELOAD {', '.join(missing)} is not loaded in this forked worker: "
+            "the forkserver (or the daemon named by SGLANG_FORKSERVER_FILE) was "
+            "started without it. Start it with the same LD_PRELOAD, or unset "
+            "SGLANG_EARLY_FORKSERVER to spawn the workers."
+        )
 
 
 def _adopt_stdio(stdio) -> None:

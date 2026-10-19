@@ -1986,6 +1986,20 @@ def _set_envs_and_config(server_args: ServerArgs):
             "is ignored for this launch"
         )
         start_method = "spawn"
+    if (
+        start_method == "forkserver"
+        and cfg.cuda_graph_persistence is not None
+        and not envs.SGLANG_FORKSERVER_ALLOW_FOUNDRY.get()
+    ):
+        # Foundry's CUDA hook is LD_PRELOADed into the workers at spawn; a forked
+        # worker has only the libraries its forkserver was started with.
+        logger.warning(
+            "--cuda-graph-persistence needs spawned workers unless the forkserver "
+            "was started with Foundry's hook in LD_PRELOAD "
+            "(SGLANG_FORKSERVER_ALLOW_FOUNDRY=1); SGLANG_EARLY_FORKSERVER is "
+            "ignored for this launch"
+        )
+        start_method = "spawn"
     mp.set_start_method(start_method, force=True)
 
     # Set gc threshold

@@ -134,8 +134,13 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`/tmp/sglang_forkserver.json`</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_FORKSERVER_ALLOW_FOUNDRY`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Keep forkserver workers under `--cuda-graph-persistence`. Foundry's CUDA hook is `LD_PRELOAD`ed into the workers at spawn, and a forked worker only has the libraries its forkserver was started with, so `--cuda-graph-persistence` otherwise falls back to `spawn`. Set it only when the forkserver (or the daemon) was started with the hook, and any other library Foundry preloads, in `LD_PRELOAD`; a forked worker missing a library of the launcher's `LD_PRELOAD` exits with an error naming it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`false`</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_MP_START_METHOD`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>multiprocessing start method the launcher applies to its workers, `spawn` or `forkserver`. Set to `forkserver` by `SGLANG_EARLY_FORKSERVER=1`; not meant to be set by hand. `--enable-memory-saver` forces `spawn` because its hook is `LD_PRELOAD`ed at exec time.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>multiprocessing start method the launcher applies to its workers, `spawn` or `forkserver`. Set to `forkserver` by `SGLANG_EARLY_FORKSERVER=1`; not meant to be set by hand. `--enable-memory-saver` forces `spawn` because its hook is `LD_PRELOAD`ed at exec time; so does `--cuda-graph-persistence` unless `SGLANG_FORKSERVER_ALLOW_FOUNDRY=1`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`spawn`</td>
     </tr>
     <tr>
