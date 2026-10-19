@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import NamedTuple, Optional
@@ -163,6 +164,10 @@ class _MooncakeEPDispatcherImpl:
 
         self.first_execution = True
         self.timeout_us = 10000000
+        if os.environ.get("EEP_FAULT_TIMING") == "1":
+            from fault_timing import get_ep_timeout_us
+
+            self.timeout_us = get_ep_timeout_us()
 
         self.handle = None
 
