@@ -238,16 +238,40 @@ class DataParallelController:
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("data_parallel_controller")
 
+    def _send_to_worker(self, slot: int, obj) -> bool:
+        """Avoid stalling the DPC on a disconnected elastic DP worker.
+
+        Each slot owns a bound PUSH socket. With no connected scheduler,
+        blocking send would also prevent processing active-rank updates.
+        """
+        worker = self.workers[slot]
+        if get_exec().moe.elastic_ep_backend is None:
+            sock_send(worker, obj)
+            return True
+        try:
+            sock_send(worker, obj, flags=zmq.NOBLOCK)
+            return True
+        except zmq.Again:
+            if self.status[slot]:
+                logger.warning(
+                    "[Elastic EP][DPC] DP worker %d is unreachable; marking it "
+                    "inactive until the next active-rank report",
+                    slot,
+                )
+                self.status[slot] = False
+                self._refresh_active_workers()
+            return False
+
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if worker is not None and self.status[i]:
-                sock_send(worker, obj)
+                self._send_to_worker(i, obj)
 
     def send_control_message(self, obj):
         for i in self._active_workers[:: self.control_message_step]:
             worker = self.workers[i]
             if worker is not None:
-                sock_send(worker, obj)
+                self._send_to_worker(i, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if get_exec().moe.elastic_ep_backend is not None:
@@ -764,7 +788,8 @@ class DataParallelController:
             ):
                 raise ValueError(f"DP rank {rank} is not active.")
             logger.debug(f"Direct routing to DP rank {rank}")
-            sock_send(self.workers[rank], req)
+            if not self._send_to_worker(rank, req):
+                raise ValueError(f"DP rank {rank} is unreachable.")
             return True
         return False
 
@@ -772,7 +797,9 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        active = self._active_workers
+        # A failed send refreshes _active_workers; visit each original slot at
+        # most once even when that list shrinks during this dispatch.
+        active = tuple(self._active_workers)
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
         attempts = 0
@@ -781,8 +808,8 @@ class DataParallelController:
             self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
             if self.status[slot]:
                 logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
+                if self._send_to_worker(slot, req):
+                    return
             attempts += 1
         raise RuntimeError(
             f"Cannot route request: all {len(active)} active DP workers "
@@ -804,7 +831,8 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
         target_worker = self.dp_budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        sock_send(self.workers[target_worker], req)
+        if not self._send_to_worker(target_worker, req):
+            self.round_robin_scheduler(req)
 
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -813,7 +841,8 @@ class DataParallelController:
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
-        sock_send(self.workers[target_worker], req)
+        if not self._send_to_worker(target_worker, req):
+            self.round_robin_scheduler(req)
 
     def event_loop(self):
         while True:
