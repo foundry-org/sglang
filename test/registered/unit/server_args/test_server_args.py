@@ -1803,6 +1803,37 @@ class TestFlashinferMegaMoeConfig(CustomTestCase):
 
 
 class TestPortArgs(unittest.TestCase):
+    def test_python_dp_follower_can_recover_with_primary_ports_bound(self):
+        args = ServerArgs(model_path="dummy")
+        args.tp_size = 4
+        args.attn_dp_size = 4
+        args.nnodes = 2
+        args.node_rank = 1
+        args.dist_init_addr = "127.0.0.1:23000"
+        args.nccl_port = 24000
+        args.elastic_ep_backend = "mooncake"
+        args.ep_join_mode = "recover"
+
+        def primary_port_in_use(port, name):
+            if 23000 <= port <= 23006:
+                raise ValueError(f"surviving primary owns {name}")
+            return True
+
+        with (
+            envs.SGLANG_RUST_SERVER.override(False),
+            patch(
+                "sglang.srt.server_args.wait_port_available",
+                side_effect=primary_port_in_use,
+            ),
+        ):
+            ports = PortArgs.init_new(args)
+            self.assertEqual(ports.tokenizer_ipc_name, "tcp://127.0.0.1:23001")
+            self.assertEqual(ports.detokenizer_ipc_name, "tcp://127.0.0.1:23002")
+            # A primary still must reject those same occupied ports.
+            args.node_rank = 0
+            with self.assertRaisesRegex(ValueError, "surviving primary owns"):
+                PortArgs.init_new(args)
+
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
         mock_temp_file.return_value.name = "temp_file"
