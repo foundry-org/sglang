@@ -279,6 +279,50 @@ class BaseTpWorker(ABC):
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
 
+    @property
+    def tokenizer(self):
+        self._load_tokenizer()
+        return self._tokenizer
+
+    @tokenizer.setter
+    def tokenizer(self, value):
+        self._tokenizer, self._tokenizer_pending = value, False
+
+    @property
+    def processor(self):
+        self._load_tokenizer()
+        return self._processor
+
+    @processor.setter
+    def processor(self, value):
+        self._processor, self._tokenizer_pending = value, False
+
+    def _load_tokenizer(self) -> None:
+        # [STARTUP-OPT-1] see __init__.
+        # A draft worker's tokenizer would only duplicate the target's:
+        # tokenizer_path always points at the target model.
+        if not self._tokenizer_pending:
+            return
+        self._tokenizer_pending = False
+        if self.model_config.is_multimodal:
+            self._processor = get_processor(
+                get_serving().tokenizer_path,
+                tokenizer_mode=get_serving().tokenizer_mode,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
+                tokenizer_backend=get_serving().tokenizer_backend,
+                model_name=get_model().model_path,
+            )
+            self._tokenizer = get_tokenizer_from_processor(self._processor)
+        else:
+            self._tokenizer = get_tokenizer(
+                get_serving().tokenizer_path,
+                tokenizer_mode=get_serving().tokenizer_mode,
+                trust_remote_code=get_model().trust_remote_code,
+                revision=get_model().revision,
+                tokenizer_backend=get_serving().tokenizer_backend,
+            )
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -322,29 +366,13 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if get_serving().skip_tokenizer_init or self.is_draft_worker:
-            # A draft worker's tokenizer would only duplicate the target's:
-            # tokenizer_path always points at the target model.
-            self.tokenizer = self.processor = None
-        else:
-            if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                    model_name=get_model().model_path,
-                )
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
-            else:
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
+        # [STARTUP-OPT-1] Lazy worker tokenizer. Loaded on first use: only
+        # speculative workers read it, and loading it here sat on the startup
+        # path between the weight load and the KV pool (~1.1 s on Qwen3-14B).
+        self._tokenizer = self._processor = None
+        self._tokenizer_pending = not (
+            get_serving().skip_tokenizer_init or self.is_draft_worker
+        )
         self.device = self.model_runner.device
 
         # Init nccl groups
