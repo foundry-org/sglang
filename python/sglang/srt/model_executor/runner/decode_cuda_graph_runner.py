@@ -86,6 +86,7 @@ from sglang.srt.model_executor.runner.early_verify_metadata import (
     VerifyInputSources,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    flashinfer_tactics_cache_for_persistence,
     maybe_flashinfer_autotune_speculative_draft,
 )
 from sglang.srt.model_executor.runner.metadata_glue_graph import MetadataGlueGraph
@@ -125,6 +126,7 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.device_timer import device_timer_ctx
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 try:
     from kt_kernel import KTMoEWrapper
@@ -1199,8 +1201,30 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
-        with self.model_context():
+        # Foundry: SAVE archives the graphs this loop captures, LOAD restores them.
+        with (
+            self.model_context(),
+            get_foundry_adapter().capture_scope(
+                phase="decode",
+                model=self.model_runner.model,
+                kind=self._foundry_graph_kind(),
+                flashinfer_tactics=flashinfer_tactics_cache_for_persistence(
+                    self.model_runner
+                ),
+            ),
+        ):
             self._capture()
+
+    def _foundry_graph_kind(self) -> str:
+        # Names this runner's graph set in Foundry's archive (EAGLE subclasses
+        # included): target_decode, target_verify, draft_decode, draft_extend.
+        role = "draft" if self.model_runner.is_draft_worker else "target"
+        mode = self.capture_forward_mode
+        if mode.is_target_verify():
+            return f"{role}_verify"
+        if mode.is_draft_extend_v2():
+            return f"{role}_extend"
+        return f"{role}_{mode.name.lower()}"
 
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
