@@ -18,6 +18,7 @@ No torch.compile.
 
 from __future__ import annotations
 
+import functools
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -52,6 +53,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var, is_cuda
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -134,6 +136,32 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
+        foundry = get_foundry_adapter()
+        if foundry.enabled:
+            # CUDA graph persistence: SAVE captures without warm-up forwards
+            # and archives the segments and breaks; LOAD restores them and runs
+            # no forward. ``capture`` is this backend's own capture body.
+            if (
+                self._debug_eager
+                or self._hicache_graph_events is not None
+                or self.deduped_cuda_graph is not None
+            ):
+                raise RuntimeError(
+                    "Foundry CUDA graph persistence does not support breakable graphs "
+                    "with debug-eager, HiCache graph events or graph dedup"
+                )
+            persisted = foundry.capture_one_breakable(
+                shape_key=shape_key,
+                capture=functools.partial(
+                    self._capture_body, shape_key, forward_fn, None
+                ),
+            )
+            if persisted is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = persisted
+                self._capture_inputs[shape_key] = capture_inputs
+                return
+            # None: Foundry fell back, capture natively.
+
         warmup_out = None
         for _ in range(2):
             self._device_module.synchronize()
@@ -143,20 +171,30 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             if post_warmup_hook is not None:
                 post_warmup_hook()
 
+        graph, stored = self._capture_body(shape_key, forward_fn, warmup_out)
+        self._graphs[shape_key] = graph
+        self._outputs[shape_key] = stored
+        # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
+        self._capture_inputs[shape_key] = capture_inputs
+
+    def _capture_body(
+        self,
+        shape_key: ShapeKey,
+        forward_fn: Callable[[], Any],
+        warmup_out: Any,
+        segment_graph_factory: Optional[Callable[[], Any]] = None,
+    ) -> tuple[BreakableCUDAGraph, Any]:
+        """Capture one shape; returns ``(graph, stored output)``. Without a
+        warm-up output (Foundry SAVE) the shared output buffer is allocated
+        from the captured output, inside the capture."""
         graph = BreakableCUDAGraph(
             self.deduped_cuda_graph, hicache_graph_events=self._hicache_graph_events
         )
         size = shape_key.size
-        if self._shared_output_buffer is None:
-            capacity_rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(
-                warmup_out
-            )
-            if capacity_rows is None:
-                capacity_rows = size
+        if self._shared_output_buffer is None and warmup_out is not None:
             self._shared_output_buffer = self._alloc_full_buffer(
-                warmup_out, capacity_rows
+                warmup_out, self._capacity_rows(warmup_out, size)
             )
-        buffer = self._shared_output_buffer
         with (
             self._hicache_graph_events.capture_scope()
             if self._hicache_graph_events is not None
@@ -166,6 +204,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 cuda_graph=graph,
                 pool=self._pool,
                 stream=self._capture_stream,
+                segment_graph_factory=segment_graph_factory,
             ),
         ):
             self._precarve.mint()
@@ -174,6 +213,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 # output buffer.
                 # The warmup ran the same forward, so its output gives the
                 # captured rows.
+                buffer = self._shared_output_buffer
                 out_rows = self._output_rows(warmup_out, size)
 
                 @eager_on_graph
@@ -184,13 +224,18 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             else:
                 out = forward_fn()
                 out_rows = self._output_rows(out, size)
+                if self._shared_output_buffer is None:
+                    self._shared_output_buffer = self._alloc_full_buffer(
+                        out, self._capacity_rows(out, size)
+                    )
+                buffer = self._shared_output_buffer
                 self._copy_output_to_buffer(out, buffer, out_rows)
 
-        stored = self._slice_output(buffer, out_rows)
-        self._graphs[shape_key] = graph
-        self._outputs[shape_key] = stored
-        # CUDA graphs retain tensor addresses, not Python tensor lifetimes.
-        self._capture_inputs[shape_key] = capture_inputs
+        return graph, self._slice_output(buffer, out_rows)
+
+    def _capacity_rows(self, output: Any, size: int) -> int:
+        rows = self._cuda_graph_runner.cuda_graph_output_capacity_rows(output)
+        return size if rows is None else rows
 
     def _output_rows(self, output: Any, cap: int) -> int:
         """Leading-dim row count actually produced by the body, clamped to ``cap``.

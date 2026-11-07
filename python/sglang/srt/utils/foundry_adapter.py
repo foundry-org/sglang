@@ -93,6 +93,13 @@ class FoundryAdapter:
         backend captures the shape natively."""
         return None
 
+    def capture_one_breakable(self, *, shape_key: Any, capture):
+        """Breakable backend (integration API 2.5): ``(graph, output)`` or None,
+        as :meth:`capture_one`. ``capture(segment_graph_factory=...)`` is the
+        backend's capture body (no warm-up forwards); LOAD restores without
+        calling it."""
+        return None
+
     # End of the scheduler's init.
     def log_init_summary(self) -> None:
         pass
@@ -205,6 +212,13 @@ class _FoundryAdapterReal(FoundryAdapter):
             forward_fn=forward_fn,
             pool=pool,
             stream=stream,
+        )
+
+    def capture_one_breakable(self, *, shape_key, capture):
+        # Only reached when Foundry's pins accepted the breakable prefill
+        # backend, which they do only from integration API 2.5.
+        return self._guarded(
+            self._api.capture_one_breakable, shape_key=shape_key, capture=capture
         )
 
     def log_init_summary(self) -> None:
