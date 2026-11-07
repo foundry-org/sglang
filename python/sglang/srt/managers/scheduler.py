@@ -386,7 +386,7 @@ from sglang.srt.utils import (
     triton_load_watch,
 )
 from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.foundry_adapter import activate_foundry
+from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -6728,6 +6728,7 @@ def run_scheduler_process(
     scheduler = None
     try:
         scheduler = Scheduler(server_args, port_args)
+        get_foundry_adapter().log_init_summary()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
