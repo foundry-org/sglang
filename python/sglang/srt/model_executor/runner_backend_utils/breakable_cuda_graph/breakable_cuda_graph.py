@@ -390,7 +390,11 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
+        segment_graph_factory: Optional[Callable[[], Any]] = None,
     ):
+        """``segment_graph_factory``: makes the graph object each segment is
+        captured into on the plain path (default ``torch.cuda.CUDAGraph``); an
+        integration that persists the segments passes its own graph class."""
         assert isinstance(cuda_graph, BreakableCUDAGraph), (
             "cuda_graph must be a BreakableCUDAGraph"
         )
@@ -404,6 +408,7 @@ class BreakableCUDAGraphCapture:
         self._forked_token = None
         self._current_graph = None
         self._current_graph_needs_instantiate = False
+        self._segment_graph_factory = segment_graph_factory
 
     def __enter__(self):
         _install_wait_stream_hook()
@@ -446,6 +451,9 @@ class BreakableCUDAGraphCapture:
             except TypeError:
                 graph = graph_cls()
                 self._current_graph_needs_instantiate = False
+        elif self._segment_graph_factory is not None:
+            graph = self._segment_graph_factory()
+            self._current_graph_needs_instantiate = False
         else:
             graph = graph_cls()
             self._current_graph_needs_instantiate = False

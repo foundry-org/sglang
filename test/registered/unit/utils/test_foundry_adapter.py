@@ -82,6 +82,7 @@ def _fake_api(
     ):
         setattr(api, name, record(name))
     api.capture_one = record("capture_one", ("graph", "out"))
+    api.capture_one_breakable = record("capture_one_breakable", ("graph", "out"))
     api.replay_saved_memory_pool_config = record(
         "replay_saved_memory_pool_config", "cfg"
     )
@@ -196,6 +197,7 @@ class TestFoundryAdapter(CustomTestCase):
             adapter.capture_one(
                 shape_key="key", forward_fn=None, pool="pool", stream="stream"
             )
+            adapter.capture_one_breakable(shape_key="key", capture=None)
             adapter.log_init_summary()
         called = {name for name, _, _ in api.calls}
         methods = {
@@ -312,6 +314,9 @@ _CALL_SITES = [
     ("model_executor/runner_backend/full_cuda_graph_backend.py",
      "FullCudaGraphBackend.capture_one", "foundry.capture_one",
      "before:self._cuda_graph_runner"),
+    ("model_executor/runner_backend/breakable_cuda_graph_backend.py",
+     "BreakableCudaGraphBackend.capture_one", "foundry.capture_one_breakable",
+     "before:warmup_out"),
     ("managers/scheduler.py", "run_scheduler_process", "activate_foundry",
      "before:publish"),
     ("managers/scheduler.py", "run_scheduler_process",
