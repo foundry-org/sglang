@@ -38,6 +38,27 @@ def diag_recover_launch_map() -> Optional[torch.Tensor]:
     return get_global_expert_location_metadata().physical_to_logical_map.clone()
 
 
+def diag_recover_expert_reload_filter(
+    *, launch_map: Optional[torch.Tensor]
+) -> Optional[Callable[[str], bool]]:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_RECOVER_RELOAD_EXPERTS): a routed-expert weight-name filter
+    when the recovery broadcast changed the logical experts of this rank's slots, else None."""
+    from sglang.srt.environ import envs
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    if launch_map is None or not envs.SGLANG_DIAG_ELASTIC_RECOVER_RELOAD_EXPERTS.get():
+        return None
+    p2l = get_global_expert_location_metadata().physical_to_logical_map
+    slots = p2l.shape[1] // get_parallel().tp_size
+    own = slice(get_parallel().tp_rank * slots, (get_parallel().tp_rank + 1) * slots)
+    if torch.equal(p2l[:, own], launch_map[:, own]):
+        return None
+    logger.info(
+        "[DIAG] recover: reloading routed experts from disk for the broadcast map"
+    )
+    return lambda name: ".experts." in name
+
+
 def diag_nixl_recover_connect(
     *, restarted_ranks: Optional[List[int]], launch_map: Optional[torch.Tensor] = None
 ) -> None:

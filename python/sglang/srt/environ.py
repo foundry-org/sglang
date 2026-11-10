@@ -1569,6 +1569,8 @@ class Envs:
     SGLANG_DIAG_ELASTIC_SCALE_TIMELINE = EnvBool(False)
     # DIAGNOSTIC ONLY: NIXL rank recovery: a restarted node connects its own ranks at init, survivors reconnect it after the PG recovery.
     SGLANG_DIAG_ELASTIC_NIXL_RECOVER = EnvBool(False)
+    # DIAGNOSTIC ONLY: with the above, a restarted rank reloads its routed experts from disk when the recovery broadcast moved its slots.
+    SGLANG_DIAG_ELASTIC_RECOVER_RELOAD_EXPERTS = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.

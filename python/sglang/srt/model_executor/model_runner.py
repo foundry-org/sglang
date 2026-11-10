@@ -43,6 +43,7 @@ from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     diag_nixl_recover_connect,
+    diag_recover_expert_reload_filter,
     diag_recover_launch_map,
     diag_scale_timeline,
     get_healthy_expert_location_src_rank,
@@ -1157,6 +1158,13 @@ class ModelRunner:
                 rank=global_ep_rank,
             )
         )
+        reload_filter = diag_recover_expert_reload_filter(launch_map=launch_map)
+        if reload_filter is not None:
+            self.weight_updater.update_weights_from_disk(
+                model_path=get_model().model_path,
+                load_format=get_model().load_format,
+                weight_name_filter=reload_filter,
+            )
 
         ElasticEPStateManager.instance().reset()
         diag_nixl_recover_connect(restarted_ranks=None, launch_map=launch_map)
