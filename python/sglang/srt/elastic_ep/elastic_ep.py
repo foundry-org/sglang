@@ -117,8 +117,10 @@ class ElasticEPState:
             self.active_ranks_cpu = self.active_ranks.detach().cpu().clone()
 
     def snapshot_active_to_last(self):
+        # In place: a fresh clone per snapshot moves later small blocks, so the init-time
+        # snapshot (capacity > world size only) would make the layout depend on the EP size.
         if self.active_ranks is not None:
-            self.last_active_ranks = self.active_ranks.clone()
+            self.last_active_ranks.copy_(self.active_ranks)
 
     def reset(self):
         if self.active_ranks is not None:
