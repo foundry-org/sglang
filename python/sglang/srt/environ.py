@@ -1553,6 +1553,8 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # DIAGNOSTIC ONLY: skip the per-forward elastic EP rank-fault check (cost measurement).
     SGLANG_DIAG_SKIP_RANK_FAULT_CHECK = EnvBool(False)
+    # DIAGNOSTIC ONLY: mix the EP rank into the dummy-weight seed of expert parameters.
+    SGLANG_DIAG_DUMMY_EXPERT_SEED_BY_RANK = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
