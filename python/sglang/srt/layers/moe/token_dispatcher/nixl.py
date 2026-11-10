@@ -482,7 +482,13 @@ class NixlEPDispatcher(BaseDispatcher):
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
 
         self._stage = _Stage.INITIAL
-        # TODO(xenshinu): add prebuild() once validated on NIXL EP; the buffer is lazy.
+
+    @property
+    def prebuild_pending(self) -> bool:
+        return NixlEPBuffer._state().buffer is None
+
+    def prebuild(self) -> None:
+        self._low_latency_dispatcher._get_buffer()
 
     def dispatch(
         self,
