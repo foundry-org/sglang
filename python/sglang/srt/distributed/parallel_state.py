@@ -337,6 +337,7 @@ class GroupCoordinator:
         self.device = _group_coordinator_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
 
+        self._mooncake_pg_active_ranks_keepalive: list[torch.Tensor] = []
         for ranks in group_ranks:
             subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
@@ -353,6 +354,9 @@ class GroupCoordinator:
                 pg_active_ranks = torch.zeros(
                     pg_active_size, dtype=torch.int32, device=self.device
                 )
+                # Keep every group's tensor alive: freeing the other groups' ones makes
+                # the caching allocator's free order, hence later small blocks, rank-dependent.
+                self._mooncake_pg_active_ranks_keepalive.append(pg_active_ranks)
                 pg_active_ranks[: len(ranks)] = 1
                 pg_active_ranks_cpu = torch.zeros(pg_active_size, dtype=torch.int32)
                 pg_active_ranks_cpu[: len(ranks)] = 1
