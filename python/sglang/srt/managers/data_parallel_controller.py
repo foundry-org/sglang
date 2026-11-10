@@ -715,8 +715,9 @@ class DataParallelController:
                     rank_port_args = PortArgs.init_new(
                         server_args, dp_rank, worker_ports
                     )
-                    if get_exec().moe.is_ep_scale_joiner:
-                        # Scale-joiner outputs return through the primary tokenizer.
+                    if get_exec().moe.is_ep_joiner:
+                        # Joiner outputs (scale or recover) return through the primary tokenizer;
+                        # their own port base comes from --port (PortArgs.init_new).
                         primary_addr = NetworkAddress.parse(
                             get_parallel().dist_init_addr
                         )
