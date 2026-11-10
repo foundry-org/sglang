@@ -691,9 +691,10 @@ def handle_elastic_ep(server_args: Any):
             "require global-rank load snapshots after scale "
             f"(got {cfg.load_balance_method})."
         )
-        assert cfg.elastic_ep_backend == "mooncake", (
+        # nixl: torch collectives stay on NCCL; only fixed-capacity launches (no scale event) were run.
+        assert cfg.elastic_ep_backend in ("mooncake", "nixl"), (
             "Elastic EP runtime scale-up requires --elastic-ep-backend "
-            f"mooncake (got elastic_ep_backend={cfg.elastic_ep_backend})."
+            f"mooncake or nixl (got elastic_ep_backend={cfg.elastic_ep_backend})."
         )
         assert cfg.pp_size == 1, (
             "Elastic EP scale-up requires --pp-size 1 "
