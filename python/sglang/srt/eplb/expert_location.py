@@ -142,9 +142,9 @@ class ExpertLocationMetadata:
         physical_to_logical_map,
         moe_ep_rank: int = None,
     ):
+        # Built on the host; _init_raw places the results on the device.
         if not isinstance(physical_to_logical_map, torch.Tensor):
             physical_to_logical_map = torch.tensor(physical_to_logical_map)
-        physical_to_logical_map = physical_to_logical_map.to(get_device().device)
 
         common = ExpertLocationMetadata._init_common(model_config)
 
@@ -286,12 +286,20 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
+        device = get_device().device
+        capacity = _num_physical_experts_capacity(num_physical_experts, ep_size=ep_size)
         return ExpertLocationMetadata(
-            physical_to_logical_map=physical_to_logical_map,
+            physical_to_logical_map=_to_device_at_capacity(
+                physical_to_logical_map, capacity=capacity, device=device
+            ),
             physical_to_logical_map_cpu=physical_to_logical_map.cpu(),
-            logical_to_all_physical_map=logical_to_all_physical_map_padded,
+            logical_to_all_physical_map=_to_device_at_capacity(
+                logical_to_all_physical_map_padded, capacity=capacity, device=device
+            ),
             logical_to_all_physical_map_cpu=logical_to_all_physical_map_padded.cpu(),
-            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
+            logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid.to(
+                device
+            ),
             ep_size=ep_size,
             logical_to_rank_dispatch_physical_map=(
                 compute_logical_to_rank_dispatch_physical_map(
@@ -303,7 +311,7 @@ class ExpertLocationMetadata:
                         if moe_ep_rank is not None
                         else torch.distributed.get_rank() % ep_size
                     ),
-                )
+                ).to(device)
                 if get_exec().moe.ep_dispatch_algorithm == "static"
                 else None
             ),
@@ -523,6 +531,29 @@ def set_global_expert_location_metadata(value, allow_overwrite=False):
     if not allow_overwrite:
         assert resources.expert_location_metadata is None
     resources.expert_location_metadata = value
+
+
+def _num_physical_experts_capacity(num_physical_experts: int, *, ep_size: int) -> int:
+    """Physical slots of all max_ep_size ranks (slots per rank are fixed)."""
+    max_ep_size = get_parallel().max_ep_size
+    if max_ep_size is None:
+        return num_physical_experts
+    return max(num_physical_experts, num_physical_experts // ep_size * max_ep_size)
+
+
+def _to_device_at_capacity(
+    tensor: torch.Tensor, *, capacity: int, device: torch.device
+) -> torch.Tensor:
+    """``tensor`` (last dim = physical experts) on ``device`` as a contiguous prefix of a
+    buffer sized for ``capacity`` physical experts, so the allocation does not depend on
+    the current EP size."""
+    num_physical = tensor.shape[-1]
+    storage = torch.empty(
+        tensor.numel() // num_physical * capacity, dtype=tensor.dtype, device=device
+    )
+    view = storage[: tensor.numel()].view(tensor.shape)
+    view.copy_(tensor)
+    return view
 
 
 def append_trivial_expert_slots(
