@@ -39,7 +39,6 @@ from sglang.srt.arg_groups.argparse_actions import (
 )
 from sglang.srt.arg_groups.model_override_base import (
     ep_joiner_of,
-    ep_scale_joiner_of,
     model_config_of,
     resolving_view,
 )
@@ -910,7 +909,9 @@ class PortArgs:
             # overflow.
             is_rust_server = envs.SGLANG_RUST_SERVER.get()
             NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
-            if ep_scale_joiner_of(resolving_view(server_args)):
+            # Every elastic joiner (scale or recover) derives its ports from --port: a
+            # recovering node on the serving node's host would collide with dist_init_port + 1.
+            if ep_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:
                     port_base = server_args.port - ZMQ_TCP_PORT_DELTA
