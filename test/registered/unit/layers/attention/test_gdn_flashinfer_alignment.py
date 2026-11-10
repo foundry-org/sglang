@@ -1,3 +1,4 @@
+import types
 import unittest
 from unittest import mock
 
@@ -6,7 +7,7 @@ import torch
 from sglang.kernels.jit.cute_aot_cache import JITCache, persistent_compile_cache
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
     FlashInferGDNKernel,
-    _FlashInferGDNCache,
+    _route_gdn_prefill_compiles_to_disk_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -413,25 +414,87 @@ class TestFlashInferGDNAlignment(CustomTestCase):
         torch.testing.assert_close(second_pool, torch.full_like(second_pool, 2))
 
 
-class TestFlashInferGDNCache(CustomTestCase):
-    def test_flashinfer_bridge_reuses_aot_cache(self):
-        kernel = type("Kernel", (), {"__module__": "flashinfer.gdn_kernels.test"})
-        ffi_option = type("EnableTVMFFI", (), {})
-        key = (((kernel, object), ("head_dim", 128)), ((ffi_option, True),))
-        aot = JITCache()
-        first = _FlashInferGDNCache({}, aot)
-        assert first.get(key) is None
-        compiled = object()
-        first[key] = compiled
-        assert aot[key] is compiled
-        second = _FlashInferGDNCache({}, aot)
-        assert second.get(key) is compiled
-        assert second[key] is compiled
-        other_key = ("non-GDN", ())
-        second[other_key] = compiled
-        assert second.get(other_key) is compiled
-        assert other_key not in aot
+class _FakeGDNKernel:
+    def __init__(self, compile_key):
+        self.compile_key = compile_key
 
+    def _get_compile_key(self):
+        return self.compile_key
+
+
+def _fake_compile_cache():
+    in_mem = {}
+
+    def cached_compile(func, *args, compile_options=None, **kwargs):
+        compiled = ("in-process", func.compile_key)
+        in_mem[(func.compile_key, compile_options)] = compiled
+        return compiled
+
+    def get_cached_compile(func, compile_options=None):
+        return in_mem.get((func.compile_key, compile_options))
+
+    return types.SimpleNamespace(
+        _in_mem_compile_cache=in_mem,
+        _compile_options_key=lambda compile_options: compile_options,
+        cached_compile=cached_compile,
+        get_cached_compile=get_cached_compile,
+    )
+
+
+class TestGDNPrefillDiskCache(CustomTestCase):
+    def _route(self, *, build_and_load):
+        compile_cache = _fake_compile_cache()
+        importer = types.ModuleType("flashinfer.gdn_kernels.delta_rule_dsl.sm90")
+        importer.cached_compile = compile_cache.cached_compile
+        bystander = types.ModuleType("flashinfer.gdn_kernels.gdn_decode")
+        rebound = _route_gdn_prefill_compiles_to_disk_cache(
+            compile_cache=compile_cache,
+            build_and_load=build_and_load,
+            key_files=["delta_rule_sm90.py"],
+            importers=[importer, bystander],
+        )
+        return compile_cache, importer, bystander, rebound
+
+    def test_miss_goes_through_disk_cache_once(self):
+        build_and_load = mock.Mock(
+            side_effect=lambda **kwargs: ("reloaded", kwargs["compile_fn"]())
+        )
+        compile_cache, importer, bystander, rebound = self._route(
+            build_and_load=build_and_load
+        )
+        assert rebound == ["sm90"]
+        assert importer.cached_compile is compile_cache.cached_compile
+        assert "cached_compile" not in bystander.__dict__
+
+        kernel = _FakeGDNKernel(compile_key=("head_dim", 128))
+        compiled = importer.cached_compile(kernel, "arg", compile_options="ffi")
+        assert compiled == ("reloaded", ("in-process", ("head_dim", 128)))
+        # The reloaded kernel replaces the in-process one for later lookups.
+        assert compile_cache.get_cached_compile(kernel, "ffi") is compiled
+        assert importer.cached_compile(kernel, "arg", compile_options="ffi") is compiled
+        build_and_load.assert_called_once()
+        call = build_and_load.call_args.kwargs
+        assert call["module_name"] == "gdn_delta_rule_prefill"
+        assert call["kernel_name"].startswith("_FakeGDNKernel_")
+        assert call["extra_key_files"] == ["delta_rule_sm90.py"]
+
+        other = _FakeGDNKernel(compile_key=("head_dim", 256))
+        importer.cached_compile(other, "arg", compile_options="ffi")
+        names = [c.kwargs["kernel_name"] for c in build_and_load.call_args_list]
+        assert len(set(names)) == 2
+
+    def test_address_in_key_compiles_in_process(self):
+        build_and_load = mock.Mock()
+        _, importer, _, _ = self._route(build_and_load=build_and_load)
+        kernel = _FakeGDNKernel(compile_key="<function f at 0x7f3a5c0d1e40>")
+        compiled = importer.cached_compile(kernel, compile_options=None)
+        assert compiled == ("in-process", kernel.compile_key)
+        build_and_load.assert_not_called()
+
+
+class TestPersistentCompileCache(CustomTestCase):
+    def test_compile_factory_reuses_aot_cache(self):
+        compiled = object()
         # Pure compile factories (e.g. the DSA indexer's LayerNorm) use the
         # same cache through a decorator, without serializing launch state.
         with mock.patch(

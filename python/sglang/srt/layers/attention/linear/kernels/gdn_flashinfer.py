@@ -10,8 +10,12 @@ Requires flashinfer >= 0.6.14.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
+import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -122,60 +126,98 @@ def maybe_build_flashinfer_checkpoint_plan(
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
-class _FlashInferGDNCache(dict):
-    """Bridge FlashInfer's dict protocol to SGLang's existing CuTe AOT cache."""
-
-    def __init__(self, previous, aot):
-        super().__init__()
-        self.aot = aot
-        for key, value in previous.items():
-            self[key] = value
-
-    @staticmethod
-    def _supported(key):
-        # The shared FI cache also serves non-GDN/non-FFI kernels. Leave those
-        # process-local; only the explicit GDN TVM-FFI key contract is supported.
-        try:
-            mro, options = key[0][0], key[1]
-            return getattr(mro[0], "__module__", "").startswith(
-                "flashinfer.gdn_kernels."
-            ) and any(
-                getattr(cls, "__name__", "") == "EnableTVMFFI" and enabled is True
-                for cls, enabled in (options or ())
-            )
-        except (TypeError, IndexError, ValueError):
-            return False
-
-    def get(self, key, default=None):
-        if key not in self and self._supported(key) and key in self.aot:
-            super().__setitem__(key, self.aot[key])
-        return super().get(key, default)
-
-    def __setitem__(self, key, value):
-        if self._supported(key):
-            self.aot[key] = value
-        super().__setitem__(key, value)
+# FlashInfer's CuTe-DSL disk cache keeps one directory per module name.
+_GDN_PREFILL_CACHE_MODULE = "gdn_delta_rule_prefill"
+_ADDRESS_IN_COMPILE_KEY = re.compile(r"0x[0-9a-fA-F]{6,}")
+_gdn_prefill_disk_cache_enabled = False
 
 
-def _enable_gdn_aot_cache():
-    from pathlib import Path
+def _gdn_prefill_kernel_name(*, kernel, compile_key) -> Optional[str]:
+    key_text = repr(compile_key)
+    # A key that holds an address names a different kernel in every process.
+    if _ADDRESS_IN_COMPILE_KEY.search(key_text):
+        return None
+    digest = hashlib.sha256(key_text.encode()).hexdigest()[:16]
+    return f"{type(kernel).__qualname__}_{digest}"
 
-    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
 
-    from sglang.kernels.jit.cute_aot_cache import get_jit_cache
+def _route_gdn_prefill_compiles_to_disk_cache(
+    *, compile_cache, build_and_load, key_files, importers
+) -> list[str]:
+    compile_in_process = compile_cache.cached_compile
 
-    previous = custom_compile_cache._in_mem_compile_cache
-    if not isinstance(previous, _FlashInferGDNCache):
-        custom_compile_cache._in_mem_compile_cache = _FlashInferGDNCache(
-            previous,
-            get_jit_cache(
-                "flashinfer_gdn",
-                source_paths=(
-                    Path(custom_compile_cache.__file__).parent.parent,
-                    __file__,
-                ),
-            ),
+    def cached_compile(func, *args, compile_options=None, **kwargs):
+        compiled = compile_cache.get_cached_compile(
+            func, compile_options=compile_options
         )
+        if compiled is not None:
+            return compiled
+
+        def compile_fn():
+            return compile_in_process(
+                func, *args, compile_options=compile_options, **kwargs
+            )
+
+        key = (
+            func._get_compile_key(),
+            compile_cache._compile_options_key(compile_options),
+        )
+        name = _gdn_prefill_kernel_name(kernel=func, compile_key=key)
+        if name is None:
+            logger.info(
+                "FlashInfer GDN prefill kernel %s compiles in process: "
+                "its compile key holds an address",
+                type(func).__qualname__,
+            )
+            return compile_fn()
+        # A miss and a hit both return the kernel reloaded from the object file.
+        compiled = build_and_load(
+            module_name=_GDN_PREFILL_CACHE_MODULE,
+            kernel_name=name,
+            compile_fn=compile_fn,
+            extra_key_files=key_files,
+        )
+        compile_cache._in_mem_compile_cache[key] = compiled
+        return compiled
+
+    compile_cache.cached_compile = cached_compile
+    rebound = []
+    for module in importers:
+        # The kernel modules bound the name with `from ... import cached_compile`.
+        if module.__dict__.get("cached_compile") is compile_in_process:
+            module.cached_compile = cached_compile
+            rebound.append(module.__name__.rsplit(".", 1)[-1])
+    return rebound
+
+
+def _enable_gdn_prefill_disk_cache():
+    # FlashInfer persists its other CuTe-DSL kernels on disk but compiles the delta-rule
+    # prefill kernels per process; drop once its cached_compile persists them itself.
+    global _gdn_prefill_disk_cache_enabled
+    if _gdn_prefill_disk_cache_enabled:
+        return
+    from flashinfer.gdn_kernels.delta_rule_dsl import custom_compile_cache
+    from flashinfer.jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    kernels_dir = Path(custom_compile_cache.__file__).parent.parent
+    rebound = _route_gdn_prefill_compiles_to_disk_cache(
+        compile_cache=custom_compile_cache,
+        build_and_load=build_and_load_cute_dsl_kernel,
+        key_files=sorted(str(path) for path in kernels_dir.rglob("*.py")),
+        importers=[
+            module
+            for name, module in list(sys.modules.items())
+            if name.startswith("flashinfer.gdn_kernels.")
+            and module is not None
+            and module is not custom_compile_cache
+        ],
+    )
+    _gdn_prefill_disk_cache_enabled = True
+    logger.info(
+        "FlashInfer GDN prefill kernels use FlashInfer's CuTe-DSL disk cache "
+        "(cached_compile rebound in %s)",
+        ", ".join(rebound) or "no module",
+    )
 
 
 def _get_flashinfer_gdn_kernels():
@@ -256,7 +298,7 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         ) = _get_flashinfer_gdn_kernels()
 
         if available:
-            _enable_gdn_aot_cache()
+            _enable_gdn_prefill_disk_cache()
 
         if not available:
             raise RuntimeError(
