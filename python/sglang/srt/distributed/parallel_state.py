@@ -389,8 +389,13 @@ class GroupCoordinator:
                     use_local_synchronization=use_local_synchronization,
                 )
             else:
-                active_ranks = torch.ones(
-                    len(ranks), dtype=torch.int32, device=self.device
+                # Only this rank's group keeps its tensor: allocating one per group and
+                # freeing the others makes the caching allocator's free order depend on
+                # the rank, so later small blocks land at rank-dependent offsets.
+                active_ranks = (
+                    torch.ones(len(ranks), dtype=torch.int32, device=self.device)
+                    if self.rank in ranks
+                    else None
                 )
                 active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
                 pg_options = get_torch_distributed_pg_options(group_name)
