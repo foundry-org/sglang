@@ -1575,6 +1575,8 @@ class Envs:
     SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK = EnvBool(False)
     # DIAGNOSTIC ONLY: NIXL EP kernel receive timeout in ms (0 = the library default, 30000).
     SGLANG_DIAG_NIXL_EP_TIMEOUT_MS = EnvInt(0)
+    # DIAGNOSTIC ONLY: skip the periodic EPLB rebalance while ranks are inactive (its P2P must not race a recover join).
+    SGLANG_DIAG_ELASTIC_NO_PERIODIC_EPLB_DEGRADED = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.

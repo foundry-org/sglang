@@ -91,6 +91,8 @@ class EPLBManager:
             for _ in range(self._rebalance_num_iterations):
                 yield
 
+            if _diag_skip_periodic_rebalance():
+                continue
             yield from self.rebalance()
 
     def rebalance(self):
@@ -293,6 +295,20 @@ class EPLBManager:
                 layer_ids=update_layer_ids,
             ),
         )
+
+
+def _diag_skip_periodic_rebalance() -> bool:
+    # DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NO_PERIODIC_EPLB_DEGRADED): while a rank is inactive the survivors skip
+    # the periodic rebalance; its PG P2P transfers hang when a restarted rank joins mid-transfer (STALE_EPOCH).
+    if not envs.SGLANG_DIAG_ELASTIC_NO_PERIODIC_EPLB_DEGRADED.get():
+        return False
+    state = ElasticEPStateManager.instance()
+    if state is None or state.active_ranks_cpu is None:
+        return False
+    degraded = not bool(state.active_ranks_cpu[: state.effective_ep_size].all())
+    if degraded:
+        logger.info("[DIAG] periodic EPLB rebalance skipped: ranks inactive")
+    return degraded
 
 
 def update_expert_location_with_recovery(
