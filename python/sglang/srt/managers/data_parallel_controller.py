@@ -874,10 +874,30 @@ class DataParallelController:
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
 
+        if (
+            envs.SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK.get()
+            and self._diag_send_skip_dead(req=req, active=active)
+        ):
+            return
         slot = active[self.round_robin_counter % len(active)]
         self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
         logger.debug(f"Choose worker {slot}")
         sock_send(self.workers[slot], req)
+
+    def _diag_send_skip_dead(self, *, req: Req, active: list[int]) -> bool:
+        # DIAGNOSTIC: a PUSH socket whose peer process died has no pipe, so a blocking send hangs this
+        # loop until the peer rebinds; skip such a slot (zmq.Again) and try the next active one.
+        for _ in range(len(active)):
+            slot = active[self.round_robin_counter % len(active)]
+            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+            try:
+                sock_send(self.workers[slot], req, flags=zmq.NOBLOCK)
+                return True
+            except zmq.Again:
+                logger.info(
+                    "[DIAG] DP worker %d unreachable (zmq.Again), next slot", slot
+                )
+        return False
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):

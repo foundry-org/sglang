@@ -2124,6 +2124,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self._diag_pg_fault_unblock()
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -2169,6 +2170,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
+            self._diag_pg_fault_unblock()
             if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
@@ -5465,6 +5467,18 @@ class Scheduler(
 
         ret.forward_launch = launch
         return ret
+
+    def _diag_pg_fault_unblock(self) -> None:
+        """DIAGNOSTIC: react to a Mooncake PG eviction before any forward (SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK)."""
+        if not (
+            self.attn_dp_enabled and get_exec().moe.elastic_ep_backend == "mooncake"
+        ):
+            return
+        from sglang.srt.elastic_ep.elastic_ep import diag_pg_fault_unblock
+
+        diag_pg_fault_unblock(
+            send_to_tokenizer=self.ipc_channels.send_to_tokenizer.send_output
+        )
 
     def _maybe_report_active_ranks(self) -> None:
         if not (self.attn_dp_enabled and get_exec().moe.elastic_ep_backend is not None):

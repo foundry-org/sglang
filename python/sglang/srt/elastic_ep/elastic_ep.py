@@ -103,6 +103,54 @@ def diag_nixl_recover_connect(
     )
 
 
+class _DiagPgFaultWatch:
+    last_mirror: Optional[List[int]] = None
+
+
+def diag_pg_fault_unblock(*, send_to_tokenizer: Callable) -> None:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK): act on a Mooncake PG eviction before any NIXL timeout.
+
+    Called once per scheduler loop iteration; reads the PG's CPU active-rank mirror (host memory, no GPU sync).
+    On a 1 -> 0 transition the NIXL EP buffer masks those ranks, so the next dispatch / combine skips them
+    instead of waiting for the kernel timeout, and the DP controller is told to stop routing to their DP ranks.
+    The rank-fault rebalance (the next combine reads the mask) and the recovery then run unchanged."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK.get():
+        return
+    mirror = get_parallel().tp_group.active_ranks_cpu.tolist()
+    last = _DiagPgFaultWatch.last_mirror
+    _DiagPgFaultWatch.last_mirror = mirror
+    if last is None:
+        return
+    evicted = [r for r, (was, now) in enumerate(zip(last, mirror)) if was and not now]
+    if not evicted:
+        return
+    t0 = time.perf_counter()
+    if get_exec().moe.moe_a2a_backend == "nixl":
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+        NixlEPBuffer.diag_mask_ranks(evicted)
+    from sglang.srt.elastic_ep.topology import (
+        attn_replica_size,
+        collapse_physical_rank_status,
+    )
+    from sglang.srt.managers.io_struct import ActiveRanksOutput
+
+    physical = ElasticEPStateManager.instance().active_ranks_cpu.tolist()
+    for r in evicted:
+        physical[r] = 0
+    dp_status = collapse_physical_rank_status(physical, attn_replica_size())
+    send_to_tokenizer(ActiveRanksOutput(status=dp_status))
+    logger.info(
+        "[DIAG] PG fault unblock: ranks %s evicted by the PG (mirror %s) -> NIXL masked, DP status %s, %.3f s",
+        evicted,
+        mirror,
+        dp_status,
+        time.perf_counter() - t0,
+    )
+
+
 def diag_scale_timeline(step: str) -> None:
     """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_TIMELINE): one wall-clock line per scale step."""
     from sglang.srt.environ import envs

@@ -134,6 +134,17 @@ class NixlEPBuffer:
         return ranks, cls._diag_mask_after_recover(state)
 
     @classmethod
+    def diag_mask_ranks(cls, ranks: list) -> None:
+        """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK): mask ranks the PG evicted. The kernels read
+        the device mask once before each receive wait (nixl_ep_ll.cu), so this releases the next
+        dispatch / combine, not one already waiting."""
+        state = cls._state()
+        if state.buffer is None:
+            return
+        for rank in ranks:
+            state.buffer.update_mask_buffer(rank, True)
+
+    @classmethod
     def _diag_mask_after_recover(cls, state) -> tuple:
         # Every rank is connected now; clean_mask_buffer unmasks the connected ranks (and masks none).
         mask = torch.zeros(state.max_ranks, dtype=torch.int32, device="cuda")
@@ -222,9 +233,15 @@ class NixlEPBuffer:
             f"num_experts_per_rank={state.num_local_experts}) "
         )
 
+        timeout_kwargs = (
+            {"timeout_ms": t}
+            if (t := envs.SGLANG_DIAG_NIXL_EP_TIMEOUT_MS.get()) > 0
+            else {}
+        )
         state.buffer = Buffer(
             rank=global_rank,
             tcp_store_group=tcp_store,
+            **timeout_kwargs,
         )
 
         state.buffer.update_memory_buffers(

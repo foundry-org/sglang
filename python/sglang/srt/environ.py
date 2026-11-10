@@ -1571,6 +1571,10 @@ class Envs:
     SGLANG_DIAG_ELASTIC_NIXL_RECOVER = EnvBool(False)
     # DIAGNOSTIC ONLY: with the above, a restarted rank reloads its routed experts from disk when the recovery broadcast moved its slots.
     SGLANG_DIAG_ELASTIC_RECOVER_RELOAD_EXPERTS = EnvBool(False)
+    # DIAGNOSTIC ONLY: once the Mooncake PG evicts a rank, mask it in the NIXL EP buffer and tell the DP controller (no NIXL timeout).
+    SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK = EnvBool(False)
+    # DIAGNOSTIC ONLY: NIXL EP kernel receive timeout in ms (0 = the library default, 30000).
+    SGLANG_DIAG_NIXL_EP_TIMEOUT_MS = EnvInt(0)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
