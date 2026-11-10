@@ -46,6 +46,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner_components.capture_state import (
+    DIAG_CAPTURE_COUNTS,
     prepare_capture_state,
 )
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
@@ -260,6 +261,7 @@ class BaseRunner(ABC):
         if getattr(mr, "_kernel_warmed_up", False):
             return
         mr._kernel_warmed_up = True
+        DIAG_CAPTURE_COUNTS["kernel_warmup"] += 1
 
         if mr.device != "cuda":
             return

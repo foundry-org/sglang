@@ -27,6 +27,9 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.model_executor.model_runner_components.capture_state import (
+    DIAG_CAPTURE_COUNTS,
+)
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
@@ -177,6 +180,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         for warmup_step in range(2):
             self._device_module.synchronize()
             self._tp_group.barrier()
+            DIAG_CAPTURE_COUNTS["capture_warmup_forward"] += 1
             with self._precarve.measure():
                 output = forward_fn()
             if self._reuse_output_buffer and warmup_step == 1:
@@ -194,6 +198,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             self._reuse_output_buffer = self._output_buffer is not None
         del warmup_output
 
+        DIAG_CAPTURE_COUNTS["native_capture"] += 1
         graph = torch.cuda.CUDAGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]

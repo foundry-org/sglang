@@ -13,6 +13,13 @@ from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
+# DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_TIMELINE): process-wide counts of the work a graph capture does.
+DIAG_CAPTURE_COUNTS = {
+    "kernel_warmup": 0,
+    "capture_warmup_forward": 0,
+    "native_capture": 0,
+}
+
 
 def prepare_capture_state(
     *,

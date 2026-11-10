@@ -42,6 +42,7 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    diag_scale_timeline,
     get_healthy_expert_location_src_rank,
     get_scale_cohort,
     join_process_groups,
@@ -576,7 +577,9 @@ class ModelRunner:
                 join_effective_ep_size,
                 self._elastic_cuda_graph_enabled(),
             )
+        diag_scale_timeline("joiner_join_begin")
         join_scale_process_group()
+        diag_scale_timeline("joiner_admitted")
         get_context().override("elastic_ep.scale_join", ep_size=join_effective_ep_size)
 
         global_ep_rank = parallel.tp_rank + parallel.ep_join_rank_offset
@@ -612,6 +615,7 @@ class ModelRunner:
             state.snapshot_active_to_last()
             state.sync_active_to_cpu()
             state.scale_phase = "syncing_new_world"
+        diag_scale_timeline("joiner_metadata_done")
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
@@ -1285,6 +1289,7 @@ class ModelRunner:
         )
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        diag_scale_timeline("init_graphs_done")
         if (
             envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 3
             and not is_scale_joiner
@@ -1304,6 +1309,7 @@ class ModelRunner:
             # Scheduler startup calls this path even when CUDA graphs are disabled.
             target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
             self._finalize_elastic_ep_joiner(target_size)
+            diag_scale_timeline("joiner_scale_done")
 
         prebuild_deepep_v2_buffer(model=self.model)
 
@@ -2449,6 +2455,7 @@ class ModelRunner:
         target_size: int,
         effective_size: int,
     ) -> None:
+        diag_scale_timeline("primary_admitted")
         self.forward_pass_id = 0
         ElasticEPStateManager.mark_configuring_data_plane()
 
@@ -2470,6 +2477,7 @@ class ModelRunner:
             src_rank=0,
         )
 
+        diag_scale_timeline("metadata_broadcast_done")
         ElasticEPStateManager.on_scale(effective_size, target_size)
         set_global_expert_distribution_recorder(
             ExpertDistributionRecorder.init_new(
@@ -2491,16 +2499,20 @@ class ModelRunner:
             physical_ep_rank=self._elastic_global_rank(),
         )
 
+        diag_scale_timeline("dp_attention_updated")
         recapture_cuda_graph = self._elastic_cuda_graph_enabled()
         if recapture_cuda_graph:
             self._recapture_elastic_cuda_graphs()
+        diag_scale_timeline("recapture_step_done")
         ElasticEPStateManager.mark_syncing_new_world()
         self._elastic_scale_ready_barrier(
             target_size=target_size,
             log_tag="JOINER" if get_exec().moe.is_ep_scale_joiner else "PRIMARY",
         )
+        diag_scale_timeline("world_barrier_done")
         ElasticEPStateManager.commit_scale()
         self._rearm_eplb_after_elastic_scale()
+        diag_scale_timeline("scale_done")
 
         if get_parallel().tp_rank == 0 and not get_exec().moe.is_ep_scale_joiner:
             from sglang.srt.managers.io_struct import ElasticScaleUpdateReq
@@ -2544,6 +2556,7 @@ class ModelRunner:
             device=self.device,
             world_group=dist.group.WORLD,
         )
+        diag_scale_timeline("config_sync_done")
         if self._diag_keep_primary_graphs():
             return
         drop_elastic_cuda_graph_state(

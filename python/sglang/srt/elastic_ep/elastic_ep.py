@@ -27,6 +27,27 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 
 
+def diag_scale_timeline(step: str) -> None:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_TIMELINE): one wall-clock line per scale step."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_DIAG_ELASTIC_SCALE_TIMELINE.get():
+        return
+    from sglang.srt.model_executor.model_runner_components.capture_state import (
+        DIAG_CAPTURE_COUNTS,
+    )
+
+    role = "joiner" if get_exec().moe.is_ep_scale_joiner else "primary"
+    logger.info(
+        "[DIAG timeline] %s tp_rank=%d step=%s t=%.3f counts=%s",
+        role,
+        get_parallel().tp_rank,
+        step,
+        time.time(),
+        DIAG_CAPTURE_COUNTS,
+    )
+
+
 class ScaleCohort(msgspec.Struct, frozen=True, kw_only=True):
     target_ep_size: int
     cuda_graph_enabled: bool

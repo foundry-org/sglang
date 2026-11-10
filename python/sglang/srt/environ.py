@@ -1563,6 +1563,8 @@ class Envs:
     SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS = EnvInt(
         0
     )  # 1 keep the old runner, 2 control: use the new one
+    # DIAGNOSTIC ONLY: log a wall-clock line per step of the elastic scale-up path, plus graph capture counters.
+    SGLANG_DIAG_ELASTIC_SCALE_TIMELINE = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
