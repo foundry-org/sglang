@@ -141,6 +141,7 @@ class ExpertLocationMetadata:
         model_config: ModelConfig,
         physical_to_logical_map,
         moe_ep_rank: int = None,
+        device: Optional[torch.device] = None,
     ):
         # Built on the host; _init_raw places the results on the device.
         if not isinstance(physical_to_logical_map, torch.Tensor):
@@ -173,6 +174,7 @@ class ExpertLocationMetadata:
             physical_to_logical_map=physical_to_logical_map,
             logical_to_all_physical_map=logical_to_all_physical_map,
             moe_ep_rank=moe_ep_rank,
+            device=device,
         )
 
     @staticmethod
@@ -272,6 +274,7 @@ class ExpertLocationMetadata:
         physical_to_logical_map: torch.Tensor,
         logical_to_all_physical_map: torch.Tensor,
         moe_ep_rank: Optional[int] = None,
+        device: Optional[torch.device] = None,
     ):
 
         _, num_physical_experts = physical_to_logical_map.shape
@@ -286,7 +289,8 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map != -1, dim=-1
         )
 
-        device = get_device().device
+        if device is None:
+            device = get_device().device
         capacity = _num_physical_experts_capacity(num_physical_experts, ep_size=ep_size)
         return ExpertLocationMetadata(
             physical_to_logical_map=_to_device_at_capacity(
@@ -587,6 +591,19 @@ def broadcast_global_expert_location_metadata(
     torch.distributed.broadcast(
         metadata.physical_to_logical_map, src=src_rank, group=group
     )
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get():
+        # DIAGNOSTIC: build on the host and write into the existing capacity-backed
+        # device tensors, so the joiner allocates no device memory here.
+        host = ExpertLocationMetadata.init_by_mapping(
+            model_config,
+            metadata.physical_to_logical_map.cpu(),
+            moe_ep_rank=moe_ep_rank,
+            device=torch.device("cpu"),
+        )
+        if _diag_copy_metadata_in_place(metadata, host):
+            return metadata
     metadata = ExpertLocationMetadata.init_by_mapping(
         model_config,
         metadata.physical_to_logical_map,
@@ -594,6 +611,58 @@ def broadcast_global_expert_location_metadata(
     )
     set_global_expert_location_metadata(metadata, allow_overwrite=True)
     return metadata
+
+
+def _diag_copy_metadata_in_place(
+    dst: ExpertLocationMetadata, src: ExpertLocationMetadata
+) -> bool:
+    """DIAGNOSTIC: copy ``src`` (host) into ``dst``'s device storage without allocating.
+    Returns False (and logs why) when a field does not fit its existing storage."""
+    device_fields = [
+        "physical_to_logical_map",
+        "logical_to_all_physical_map",
+        "logical_to_all_physical_map_num_valid",
+        "logical_to_rank_dispatch_physical_map",
+    ]
+    plan = {}
+    for name in device_fields:
+        old, new = getattr(dst, name), getattr(src, name)
+        desc = (
+            f"{name}: old {None if old is None else (tuple(old.shape), old.dtype)}"
+            f" storage {None if old is None else old.untyped_storage().nbytes()} B,"
+            f" new {None if new is None else (tuple(new.shape), new.dtype)}"
+        )
+        logger.info("[DIAG] expert-location in-place: %s", desc)
+        if (old is None) != (new is None):
+            logger.warning("[DIAG] expert-location in-place NOT valid: %s", desc)
+            return False
+        if old is None:
+            continue
+        nbytes = new.numel() * new.element_size()
+        if (
+            old.dtype != new.dtype
+            or old.storage_offset() != 0
+            or nbytes > old.untyped_storage().nbytes()
+        ):
+            logger.warning("[DIAG] expert-location in-place NOT valid: %s", desc)
+            return False
+        plan[name] = old.as_strided(new.shape, new.contiguous().stride(), 0)
+    if dst._mega_gate_maps:
+        logger.warning(
+            "[DIAG] expert-location in-place NOT valid: mega_gate_maps already built"
+        )
+        return False
+    for name, view in plan.items():
+        view.copy_(getattr(src, name))
+        setattr(dst, name, view)
+    dst.physical_to_logical_map_cpu = src.physical_to_logical_map_cpu
+    dst.logical_to_all_physical_map_cpu = src.logical_to_all_physical_map_cpu
+    dst.ep_size = src.ep_size
+    dst.__post_init__()
+    logger.info(
+        "[DIAG] expert-location metadata updated in place (ep_size=%d)", dst.ep_size
+    )
+    return True
 
 
 def _compute_logical_to_all_physical_map(
