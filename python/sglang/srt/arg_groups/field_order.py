@@ -561,5 +561,7 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_max_page_tokens",
     "enable_fp4_indexer",
     "paged_experts_enable_disk",
+    "cuda_graph_persistence",
+    "cuda_graph_persistence_config",
 )
 # fmt: on
