@@ -1839,6 +1839,8 @@ def _dummy_expert_seed_offset() -> int:
     # DIAGNOSTIC: rank-distinct expert weights, so outputs depend on which rank computes.
     if not envs.SGLANG_DIAG_DUMMY_EXPERT_SEED_BY_RANK.get():
         return 0
+    if envs.SGLANG_DIAG_DUMMY_EXPERT_SAME_SEED.get():
+        return 1
     from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_rank
 
     return 1 + get_moe_expert_parallel_rank()
