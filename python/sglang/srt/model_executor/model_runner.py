@@ -1938,7 +1938,10 @@ class ModelRunner:
             ) as recorder_outputs,
         ):
             output = self._forward_raw(forward_batch, pp_proxy_tensors)
-            if self.enable_elastic_ep:
+            if (
+                self.enable_elastic_ep
+                and not envs.SGLANG_DIAG_SKIP_RANK_FAULT_CHECK.get()
+            ):
                 output = self._maybe_rebalance_after_rank_fault(
                     output, forward_batch, pp_proxy_tensors
                 )
