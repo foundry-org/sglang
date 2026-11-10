@@ -74,6 +74,7 @@ class NixlEPBuffer:
                 connected_ep_size=None,
                 scale_to=None,
                 dispatch_ep_size=None,
+                max_ranks=None,
             )
             buffers["nixl_ep_state"] = state
         return state
@@ -190,6 +191,7 @@ class NixlEPBuffer:
         state.connected_ep_size = scale_to
         state.scale_to = scale_to
         state.dispatch_ep_size = scale_to
+        state.max_ranks = nixl_max_ranks
         return state.buffer
 
     @classmethod
@@ -365,10 +367,9 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         state = NixlEPBuffer._state()
-        dispatch_ep_size = state.dispatch_ep_size
-        num_local_experts = state.num_local_experts
-        assert dispatch_ep_size is not None and num_local_experts is not None
-        nixl_num_experts = num_local_experts * dispatch_ep_size
+        # Expert capacity of all max_ep_size ranks, not the active ones: rank_bound, the
+        # recv layout and the launch shape stay fixed as ranks join or leave.
+        nixl_num_experts = state.num_local_experts * state.max_ranks
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
             buffer.dispatch(
                 hidden_states,

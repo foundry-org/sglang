@@ -2545,7 +2545,7 @@ def init_distributed_environment(
                 dist_init_addr=distributed_init_method,
                 allow_dynamic_membership=(
                     recovered_rank
-                    or (max_world_size is not None and max_world_size > world_size)
+                    or (max_world_size is not None and max_world_size >= world_size)
                 ),
             )
 
