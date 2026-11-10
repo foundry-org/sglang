@@ -188,6 +188,9 @@ class NixlEPBuffer:
         initial_ep_size = offset + world_size
         scale_to = max(initial_ep_size, state.scale_to or 0)
         cls._connect_ranks(state, list(range(scale_to)), tag="initial")
+        # The device mask reads 0 for ranks never connected; mask them so capacity-wide
+        # readers (active_ranks refresh) see them as inactive.
+        state.buffer.clean_mask_buffer()
         state.connected_ep_size = scale_to
         state.scale_to = scale_to
         state.dispatch_ep_size = scale_to
@@ -423,8 +426,9 @@ class _NixlEPDispatcherImpl(_NixlEPDispatcherImplBase):
         if self._mask_buffer is not None:
             buffer.query_mask_buffer(self._mask_buffer)
 
-            n = ElasticEPStateManager.get_data_plane_ep_size()
-            self.active_ranks[:n].copy_(1 - self._mask_buffer[:n])
+            # Whole capacity: never-connected ranks are masked (clean_mask_buffer above),
+            # so the copy does not depend on the current EP size.
+            self.active_ranks.copy_(1 - self._mask_buffer)
 
         self.packed_recv_count = self.handle = None
         return combined_hidden_states, event, hook
