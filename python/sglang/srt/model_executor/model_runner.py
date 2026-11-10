@@ -1254,10 +1254,14 @@ class ModelRunner:
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
         is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
+        joiner_init_load = (
+            is_scale_joiner and envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
+        )
         defer_decode_capture = (
             is_scale_joiner
             and capture_decode_cuda_graph
             and self._elastic_cuda_graph_enabled()
+            and not joiner_init_load
         )
         if is_scale_joiner:
             self._validate_elastic_cuda_graph_recapture()
@@ -1267,7 +1271,9 @@ class ModelRunner:
                 capture_decode_cuda_graph and not defer_decode_capture
             ),
             finalize=not defer_decode_capture,
-            defer_distributed_setup=defer_decode_capture,
+            # DIAGNOSTIC joiner_init_load: capture (restore) now, but no warmup forwards: the
+            # joiner's peers are only reachable at the scale step.
+            defer_distributed_setup=defer_decode_capture or joiner_init_load,
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
@@ -1279,12 +1285,22 @@ class ModelRunner:
         )
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        if (
+            envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 3
+            and not is_scale_joiner
+            and self.decode_cuda_graph_runner is not None
+        ):
+            # DIAGNOSTIC control: the throwaway capture of mode 1 without any scale event.
+            self._diag_keep_primary_graphs_mode(use_new=False)
 
         if is_scale_joiner:
             if self._elastic_cuda_graph_enabled():
                 if defer_decode_capture:
                     self._recapture_elastic_cuda_graphs()
                     finalize_cuda_graph_capture(self)
+                elif joiner_init_load:
+                    # Matches the primary's scale-step sequence; keeps the restored runner.
+                    self._recapture_elastic_cuda_graphs()
             # Scheduler startup calls this path even when CUDA graphs are disabled.
             target_size = get_parallel().ep_join_rank_offset + get_parallel().tp_size
             self._finalize_elastic_ep_joiner(target_size)
@@ -2553,15 +2569,40 @@ class ModelRunner:
         # native capture runs warmup dispatches with every rank, so the primary still runs a
         # throwaway capture to match them, then restores its old runner.
         if (
-            not envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get()
-            or get_exec().moe.is_ep_scale_joiner
+            envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() not in (1, 2)
+            or (
+                get_exec().moe.is_ep_scale_joiner
+                and not envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
+            )
             or self.decode_cuda_graph_runner is None
         ):
             return False
-        kept = self.decode_cuda_graph_runner
-        throwaway = recapture_elastic_cuda_graph(model_runner=self)
         # Mode 2 is the control: same capture without the drop, but serve with the new runner.
-        use_new = envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 2
+        self._diag_keep_primary_graphs_mode(
+            use_new=envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 2
+        )
+        return True
+
+    def _diag_keep_primary_graphs_mode(self, *, use_new: bool) -> None:
+        kept = self.decode_cuda_graph_runner
+        # The new runner's construction re-initialises the shared attention backend's graph
+        # state; the kept graphs read the old buffers, so restore them (shallow) afterwards.
+        attn_state = dict(vars(self.attn_backend))
+        # A Foundry-restored primary must not open a second capture scope: make the adapter
+        # inert for the throwaway capture only (it runs natively), then restore it.
+        from sglang.srt.utils.foundry_adapter import get_foundry_adapter
+
+        adapter = get_foundry_adapter()
+        saved_unsupported = getattr(adapter, "_unsupported", None)
+        if hasattr(adapter, "_unsupported") and saved_unsupported is None:
+            adapter._unsupported = ("diag", "elastic throwaway capture")
+        try:
+            throwaway = recapture_elastic_cuda_graph(model_runner=self)
+        finally:
+            if hasattr(adapter, "_unsupported"):
+                adapter._unsupported = saved_unsupported
+        if not use_new:
+            vars(self.attn_backend).update(attn_state)
         self.decode_cuda_graph_runner = throwaway.runner if use_new else kept
         logger.info(
             "[DIAG] elastic scale-up: primary serves with runner id=%#x (%s; old %#x, new %#x)",
@@ -2570,7 +2611,6 @@ class ModelRunner:
             id(kept),
             id(throwaway.runner),
         )
-        return True
 
     def maybe_join_ep_ranks(self) -> None:
         if not ElasticEPStateManager.is_scaling():

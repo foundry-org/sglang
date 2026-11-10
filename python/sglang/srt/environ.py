@@ -1558,6 +1558,8 @@ class Envs:
     # DIAGNOSTIC ONLY: with the above, use the same expert seed on every rank (control run).
     SGLANG_DIAG_DUMMY_EXPERT_SAME_SEED = EnvBool(False)
     # DIAGNOSTIC ONLY: on elastic scale-up the primary keeps its decode graphs (throwaway capture for the joiners' collectives).
+    # DIAGNOSTIC ONLY: a scale joiner restores its decode graphs at init (no deferred capture; NIXL connect at the scale step).
+    SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD = EnvBool(False)
     SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS = EnvInt(
         0
     )  # 1 keep the old runner, 2 control: use the new one

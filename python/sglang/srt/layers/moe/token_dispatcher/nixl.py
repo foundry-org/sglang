@@ -25,6 +25,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_resources,
 )
@@ -187,11 +188,19 @@ class NixlEPBuffer:
         )
         initial_ep_size = offset + world_size
         scale_to = max(initial_ep_size, state.scale_to or 0)
-        cls._connect_ranks(state, list(range(scale_to)), tag="initial")
-        # The device mask reads 0 for ranks never connected; mask them so capacity-wide
-        # readers (active_ranks refresh) see them as inactive.
-        state.buffer.clean_mask_buffer()
-        state.connected_ep_size = scale_to
+        if (
+            get_exec().moe.is_ep_scale_joiner
+            and envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
+        ):
+            # DIAGNOSTIC: buffer built at init; every peer is connected at the scale step
+            # (_update_connections on the next get_nixl_buffer after on_scale).
+            state.connected_ep_size = 0
+        else:
+            cls._connect_ranks(state, list(range(scale_to)), tag="initial")
+            # The device mask reads 0 for ranks never connected; mask them so capacity-wide
+            # readers (active_ranks refresh) see them as inactive.
+            state.buffer.clean_mask_buffer()
+            state.connected_ep_size = scale_to
         state.scale_to = scale_to
         state.dispatch_ep_size = scale_to
         state.max_ranks = nixl_max_ranks

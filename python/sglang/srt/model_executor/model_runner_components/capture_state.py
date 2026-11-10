@@ -8,6 +8,7 @@ import logging
 import torch
 from torch import nn
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,11 @@ def prepare_capture_state(
 
     # A joiner's EP buffers are collectives with ranks it meets only at the
     # elastic rendezvous; they keep their lazy (or post-rendezvous) creation.
-    num_dispatchers = 0 if is_ep_scale_joiner else prebuild_dispatchers(model)
+    # DIAGNOSTIC joiner_init_load: the joiner builds its buffers now and connects at the scale step.
+    joiner_prebuild = envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
+    num_dispatchers = (
+        0 if is_ep_scale_joiner and not joiner_prebuild else prebuild_dispatchers(model)
+    )
     # A draft warms up after the target's graphs are captured, past the point
     # where persisted graphs need driver-placed symmetric memory; it stays lazy.
     num_gatherers = (

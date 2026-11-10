@@ -420,6 +420,14 @@ def capture_cuda_graphs(
     # runners point at it) and the eager fallback when a cg runner can't run a
     # batch.
     eager_runner = EagerRunner(model_runner, run_warmup=not defer_distributed_setup)
+    if (
+        defer_distributed_setup
+        and capture_decode_cuda_graph
+        and envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
+    ):
+        # DIAGNOSTIC: a joiner restoring at init still builds its capture state (buffers,
+        # expert maps) before the capture scope; only the communicating warmup is skipped.
+        eager_runner._prepare_capture_state()
 
     if not defer_distributed_setup:
         refresh_deep_gemm_layout_memory_budget(model_runner)
