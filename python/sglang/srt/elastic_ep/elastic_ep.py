@@ -27,6 +27,61 @@ logger = logging.getLogger(__name__)
 _SCALE_COHORT_KEY_PREFIX = "elastic_ep/scale_cohort"
 
 
+def diag_recover_launch_map() -> Optional[torch.Tensor]:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NIXL_RECOVER): a restarted rank's expert map before the
+    recovery broadcast; its expert weights were loaded for this map."""
+    from sglang.srt.environ import envs
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    if not envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get():
+        return None
+    return get_global_expert_location_metadata().physical_to_logical_map.clone()
+
+
+def diag_nixl_recover_connect(
+    *, restarted_ranks: Optional[List[int]], launch_map: Optional[torch.Tensor] = None
+) -> None:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NIXL_RECOVER): NIXL connections after a PG recovery;
+    survivors pass the restarted ranks, a restarted rank passes None. Both sides rendezvous here."""
+    from sglang.srt.environ import envs
+
+    if (
+        not envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get()
+        or get_exec().moe.moe_a2a_backend != "nixl"
+    ):
+        return
+    from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+    t0 = time.perf_counter()
+    if restarted_ranks is None:
+        ranks, masks = NixlEPBuffer.diag_connect_recover_pending()
+        role = "restarted"
+    else:
+        masks = NixlEPBuffer.diag_reconnect_restarted_ranks(restarted_ranks)
+        ranks, role = restarted_ranks, "survivor"
+    from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    if launch_map is not None:
+        # Per rank: (layer, slot) entries whose logical expert differs between the broadcast map
+        # and the map this rank loaded its weights for.
+        p2l = get_global_expert_location_metadata().physical_to_logical_map
+        moved = (
+            (p2l != launch_map).sum(dim=0).view(get_parallel().tp_size, -1).sum(dim=1)
+        )
+        logger.info(
+            "[DIAG] NIXL recover: map entries changed vs this rank's load-time map, per rank=%s",
+            moved.tolist(),
+        )
+    logger.info(
+        "[DIAG] NIXL recover: %s connected ranks=%s mask before/after clean=%s/%s in %.3f s",
+        role,
+        ranks,
+        masks[0],
+        masks[1],
+        time.perf_counter() - t0,
+    )
+
+
 def diag_scale_timeline(step: str) -> None:
     """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_TIMELINE): one wall-clock line per scale step."""
     from sglang.srt.environ import envs
@@ -581,6 +636,7 @@ def maybe_recover_ep_ranks(
             ),
         )
         ElasticEPStateManager.instance().reset()
+        diag_nixl_recover_connect(restarted_ranks=ranks_to_recover)
         logger.info(f"recover ranks {ranks_to_recover} done")
         return True
 

@@ -42,6 +42,8 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    diag_nixl_recover_connect,
+    diag_recover_launch_map,
     diag_scale_timeline,
     get_healthy_expert_location_src_rank,
     get_scale_cohort,
@@ -1139,6 +1141,7 @@ class ModelRunner:
 
     def post_capture_elastic_ep_recover(self):
         join_process_groups()
+        launch_map = diag_recover_launch_map()
 
         global_ep_rank = get_parallel().tp_rank + get_parallel().ep_join_rank_offset
         broadcast_global_expert_location_metadata(
@@ -1156,6 +1159,7 @@ class ModelRunner:
         )
 
         ElasticEPStateManager.instance().reset()
+        diag_nixl_recover_connect(restarted_ranks=None, launch_map=launch_map)
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

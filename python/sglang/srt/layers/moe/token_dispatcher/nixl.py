@@ -76,6 +76,7 @@ class NixlEPBuffer:
                 scale_to=None,
                 dispatch_ep_size=None,
                 max_ranks=None,
+                diag_recover_pending=None,
             )
             buffers["nixl_ep_state"] = state
         return state
@@ -112,6 +113,35 @@ class NixlEPBuffer:
         new_ranks = list(range(state.connected_ep_size, scale_to))
         cls._connect_ranks(state, new_ranks, tag="update")
         state.connected_ep_size = scale_to
+
+    @classmethod
+    def diag_reconnect_restarted_ranks(cls, ranks: list) -> tuple:
+        """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NIXL_RECOVER): a survivor drops the dead peers'
+        connections and connects their restarted processes (same rank ids)."""
+        state = cls._state()
+        state.buffer.disconnect_ranks(ranks)
+        cls._connect_ranks(state, ranks, tag="recover")
+        return cls._diag_mask_after_recover(state)
+
+    @classmethod
+    def diag_connect_recover_pending(cls) -> tuple:
+        """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NIXL_RECOVER): a restarted rank connects the survivors."""
+        state = cls._state()
+        ranks = state.diag_recover_pending or []
+        if ranks:
+            cls._connect_ranks(state, ranks, tag="recover")
+        state.diag_recover_pending = None
+        return ranks, cls._diag_mask_after_recover(state)
+
+    @classmethod
+    def _diag_mask_after_recover(cls, state) -> tuple:
+        # Every rank is connected now; clean_mask_buffer unmasks the connected ranks (and masks none).
+        mask = torch.zeros(state.max_ranks, dtype=torch.int32, device="cuda")
+        state.buffer.query_mask_buffer(mask)
+        before = mask.tolist()
+        state.buffer.clean_mask_buffer()
+        state.buffer.query_mask_buffer(mask)
+        return before, mask.tolist()
 
     @classmethod
     def connect_scheduled_ranks(cls) -> list:
@@ -211,6 +241,19 @@ class NixlEPBuffer:
             # DIAGNOSTIC: buffer built at init; every peer is connected at the scale step
             # (_update_connections on the next get_nixl_buffer after on_scale).
             state.connected_ep_size = 0
+        elif (
+            get_exec().moe.ep_join_mode == "recover"
+            and envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get()
+        ):
+            # DIAGNOSTIC: a restarted node connects its own ranks now; the survivors are reachable
+            # only after the PG recovery, where diag_connect_recover_pending connects them.
+            node_size = world_size // get_parallel().nnodes
+            first = global_rank // node_size * node_size
+            own = list(range(first, first + node_size))
+            cls._connect_ranks(state, own, tag="recover-local")
+            state.buffer.clean_mask_buffer()
+            state.diag_recover_pending = [r for r in range(scale_to) if r not in own]
+            state.connected_ep_size = scale_to
         else:
             cls._connect_ranks(state, list(range(scale_to)), tag="initial")
             # The device mask reads 0 for ranks never connected; mask them so capacity-wide

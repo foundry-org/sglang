@@ -593,9 +593,13 @@ def broadcast_global_expert_location_metadata(
     )
     from sglang.srt.environ import envs
 
-    if envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get():
+    if (
+        envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
+        or envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get()
+    ):
         # DIAGNOSTIC: build on the host and write into the existing capacity-backed
-        # device tensors, so the joiner allocates no device memory here.
+        # device tensors, so the joiner allocates no device memory here; captured graphs
+        # keep reading these tensors (a new metadata object would leave them stale).
         host = ExpertLocationMetadata.init_by_mapping(
             model_config,
             metadata.physical_to_logical_map.cpu(),
