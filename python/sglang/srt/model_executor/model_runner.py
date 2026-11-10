@@ -2528,6 +2528,8 @@ class ModelRunner:
             device=self.device,
             world_group=dist.group.WORLD,
         )
+        if self._diag_keep_primary_graphs():
+            return
         drop_elastic_cuda_graph_state(
             decode_runner=self.decode_cuda_graph_runner,
             eager_runner=self.eager_runner,
@@ -2545,6 +2547,30 @@ class ModelRunner:
             capture.time_usage,
             phases=("decode", "target_verify", "draft_decode"),
         )
+
+    def _diag_keep_primary_graphs(self) -> bool:
+        # DIAGNOSTIC: keep the primary's launch-time decode graphs across a scale-up. The joiners'
+        # native capture runs warmup dispatches with every rank, so the primary still runs a
+        # throwaway capture to match them, then restores its old runner.
+        if (
+            not envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get()
+            or get_exec().moe.is_ep_scale_joiner
+            or self.decode_cuda_graph_runner is None
+        ):
+            return False
+        kept = self.decode_cuda_graph_runner
+        throwaway = recapture_elastic_cuda_graph(model_runner=self)
+        # Mode 2 is the control: same capture without the drop, but serve with the new runner.
+        use_new = envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 2
+        self.decode_cuda_graph_runner = throwaway.runner if use_new else kept
+        logger.info(
+            "[DIAG] elastic scale-up: primary serves with runner id=%#x (%s; old %#x, new %#x)",
+            id(self.decode_cuda_graph_runner),
+            "new, control" if use_new else "kept",
+            id(kept),
+            id(throwaway.runner),
+        )
+        return True
 
     def maybe_join_ep_ranks(self) -> None:
         if not ElasticEPStateManager.is_scaling():

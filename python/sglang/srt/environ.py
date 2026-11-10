@@ -1557,6 +1557,10 @@ class Envs:
     SGLANG_DIAG_DUMMY_EXPERT_SEED_BY_RANK = EnvBool(False)
     # DIAGNOSTIC ONLY: with the above, use the same expert seed on every rank (control run).
     SGLANG_DIAG_DUMMY_EXPERT_SAME_SEED = EnvBool(False)
+    # DIAGNOSTIC ONLY: on elastic scale-up the primary keeps its decode graphs (throwaway capture for the joiners' collectives).
+    SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS = EnvInt(
+        0
+    )  # 1 keep the old runner, 2 control: use the new one
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_ENABLE_MOE_DEFERRED_FINALIZE = EnvBool(True)
     # The [M*top_k, hidden] HBM round trip pays only at small M; 0 disables.
