@@ -382,6 +382,38 @@ def recapture_elastic_cuda_graph(
     return capture
 
 
+def diag_prepare_kept_elastic_graphs(*, model_runner: ModelRunner) -> None:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_ZERO_CAPTURE_JOIN): the scale step of a rank that keeps
+    its decode graphs, without the recapture. Every rank runs it at the same point."""
+    from sglang.srt.elastic_ep.elastic_ep import diag_scale_timeline
+
+    attn_backend = model_runner.attn_backend
+    attn_state_before = dict(vars(attn_backend))
+    # The eager (prefill) path reads this budget; the joiner skipped it at init.
+    refresh_deep_gemm_layout_memory_budget(model_runner)
+    diag_scale_timeline("deepgemm_budget_done")
+    connected = []
+    if get_exec().moe.moe_a2a_backend == "nixl":
+        from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
+
+        # A replay of a kept graph never runs get_nixl_buffer, which connects lazily.
+        connected = NixlEPBuffer.connect_scheduled_ranks()
+    current_platform.synchronize()
+    diag_scale_timeline("nixl_connect_done")
+    attn_state_after = vars(attn_backend)
+    changed = sorted(
+        key
+        for key in set(attn_state_before) | set(attn_state_after)
+        if attn_state_before.get(key) is not attn_state_after.get(key)
+    )
+    logger.info(
+        "[DIAG] zero-capture scale step: nixl connected ranks=%s, attention backend "
+        "attributes rebound=%s",
+        connected,
+        changed,
+    )
+
+
 def drop_elastic_cuda_graph_state(
     *, decode_runner: Optional[BaseRunner], eager_runner: EagerRunner
 ) -> None:

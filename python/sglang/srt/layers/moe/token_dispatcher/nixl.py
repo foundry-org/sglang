@@ -114,6 +114,22 @@ class NixlEPBuffer:
         state.connected_ep_size = scale_to
 
     @classmethod
+    def connect_scheduled_ranks(cls) -> list:
+        """Connect the ranks ``on_scale`` scheduled now, instead of at the next eager dispatch
+        (a kept graph's replay never calls ``get_nixl_buffer``). Returns the ranks connected."""
+        state = cls._state()
+        if (
+            state.buffer is None
+            or state.scale_to is None
+            or state.connected_ep_size is None
+            or state.scale_to <= state.connected_ep_size
+        ):
+            return []
+        new_ranks = list(range(state.connected_ep_size, state.scale_to))
+        cls._update_connections(state, state.scale_to)
+        return new_ranks
+
+    @classmethod
     def get_nixl_buffer(
         cls,
         group: dist.ProcessGroup,

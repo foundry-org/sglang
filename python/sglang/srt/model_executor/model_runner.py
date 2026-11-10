@@ -146,6 +146,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_cuda_graphs,
     capture_decode_graph,
     capture_prefill_graph,
+    diag_prepare_kept_elastic_graphs,
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
@@ -2597,6 +2598,13 @@ class ModelRunner:
         return True
 
     def _diag_keep_primary_graphs_mode(self, *, use_new: bool) -> None:
+        if envs.SGLANG_DIAG_ELASTIC_ZERO_CAPTURE_JOIN.get() and not use_new:
+            diag_prepare_kept_elastic_graphs(model_runner=self)
+            logger.info(
+                "[DIAG] elastic scale-up: serves with runner id=%#x (kept, zero capture)",
+                id(self.decode_cuda_graph_runner),
+            )
+            return
         kept = self.decode_cuda_graph_runner
         # The new runner's construction re-initialises the shared attention backend's graph
         # state; the kept graphs read the old buffers, so restore them (shallow) afterwards.

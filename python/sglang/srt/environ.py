@@ -1563,6 +1563,8 @@ class Envs:
     SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS = EnvInt(
         0
     )  # 1 keep the old runner, 2 control: use the new one
+    # DIAGNOSTIC ONLY: with the two above, the scale step runs no capture on any rank (kept graphs, explicit NIXL connect).
+    SGLANG_DIAG_ELASTIC_ZERO_CAPTURE_JOIN = EnvBool(False)
     # DIAGNOSTIC ONLY: log a wall-clock line per step of the elastic scale-up path, plus graph capture counters.
     SGLANG_DIAG_ELASTIC_SCALE_TIMELINE = EnvBool(False)
     SGLANG_PPLX_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
