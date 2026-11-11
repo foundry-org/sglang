@@ -1555,6 +1555,10 @@ class Envs:
     SGLANG_DIAG_SKIP_RANK_FAULT_CHECK = EnvBool(False)
     # DIAGNOSTIC ONLY: log the wall time of the per-step DP MLP sync collective (scheduler side).
     SGLANG_DIAG_MLP_SYNC_TIMING = EnvBool(False)
+    # DIAGNOSTIC ONLY: count torch.distributed collectives per group and caller, logged every 20 s.
+    SGLANG_DIAG_COLLECTIVE_COUNTS = EnvBool(False)
+    # DIAGNOSTIC ONLY: SIGUSR1 makes a scheduler process dump all Python thread stacks to stderr; py-spy may attach.
+    SGLANG_DIAG_FAULTHANDLER_USR1 = EnvBool(False)
     # DIAGNOSTIC ONLY: mix the EP rank into the dummy-weight seed of expert parameters.
     SGLANG_DIAG_DUMMY_EXPERT_SEED_BY_RANK = EnvBool(False)
     # DIAGNOSTIC ONLY: with the above, use the same expert seed on every rank (control run).

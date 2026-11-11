@@ -341,6 +341,19 @@ def _init_parallel_groups(
     )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(server_args=server_args)
+    if envs.SGLANG_DIAG_COLLECTIVE_COUNTS.get():
+        from sglang.srt.elastic_ep.diag_collectives import install
+
+        install()
+    if envs.SGLANG_DIAG_FAULTHANDLER_USR1.get():
+        import faulthandler
+        import signal
+
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
+        # PR_SET_PTRACER(PR_SET_PTRACER_ANY): py-spy of the same user may attach under ptrace_scope=1.
+        import ctypes
+
+        ctypes.CDLL(None).prctl(0x59616D61, ctypes.c_ulong(-1), 0, 0, 0)
     if is_npu():
         register_sgl_tp_rank(gpu_id)
 
