@@ -597,6 +597,38 @@ class _LayerBasedCpuSinglePassGatherer(_SinglePassGatherer):
         return torch.tensor(data)
 
 
+_DIAG_PERSISTENT_PHYSICAL_BUFFERS: Dict[str, torch.Tensor] = {}
+
+
+def _diag_persistent_physical_buffer(
+    name: str, *, leading: Tuple[int, ...], metadata: ExpertLocationMetadata
+) -> Optional[torch.Tensor]:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS): one buffer per name, allocated once at the physical slot
+    capacity of --max-ep-size and reused by every recorder built later (scale-up, joiner admission). Graphs kept
+    across a scale-up, or captured on the primary and restored on a joiner, write the counts through the captured
+    pointer; a recorder rebuilt per EP size would free it, and its size would differ between primary and joiner."""
+    if not envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get():
+        return None
+    from sglang.srt.runtime_context import get_parallel
+
+    capacity = metadata.num_local_physical_experts * max(
+        get_parallel().max_ep_size or 0, metadata.ep_size
+    )
+    buf = _DIAG_PERSISTENT_PHYSICAL_BUFFERS.get(name)
+    if buf is None:
+        buf = torch.zeros(
+            (*leading, capacity), dtype=torch.int, device=get_device_namespace().device
+        )
+        _DIAG_PERSISTENT_PHYSICAL_BUFFERS[name] = buf
+    assert buf.shape == (*leading, capacity), (
+        name,
+        tuple(buf.shape),
+        leading,
+        capacity,
+    )
+    return buf
+
+
 def _list_sum(a: List, b: List) -> List:
     return [x + y for x, y in zip(a, b, strict=True)]
 
@@ -608,6 +640,21 @@ class _LayerBasedGpuSinglePassGatherer(_SinglePassGatherer):
         device = get_device()
 
         self._enable_global_physical_experts = enable_global_physical_experts
+        persistent = (
+            _diag_persistent_physical_buffer(
+                "gatherer",
+                leading=(self._expert_location_metadata.num_layers,),
+                metadata=self._expert_location_metadata,
+            )
+            if enable_global_physical_experts
+            else None
+        )
+        if persistent is not None:
+            persistent.zero_()
+            self._data = persistent[
+                :, : self._expert_location_metadata.num_physical_experts
+            ]
+            return
         self._data = torch.zeros(
             (
                 self._expert_location_metadata.num_layers,
@@ -980,6 +1027,23 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 class _StatAccumulator(_UtilizationRateAccumulatorMixin):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        buffer_size = get_exec().moe.expert_distribution_recorder_buffer_size
+        persistent = (
+            _diag_persistent_physical_buffer(
+                "accumulator",
+                leading=(buffer_size, self._expert_location_metadata.num_layers),
+                metadata=self._expert_location_metadata,
+            )
+            if buffer_size > 0
+            else None
+        )
+        if persistent is not None:
+            persistent.zero_()
+            self._global_physical_count_of_buffered_step = _CircularBuffer.over(
+                persistent[..., : self._expert_location_metadata.num_physical_experts]
+            )
+            self._first_dump = True
+            return
         self._global_physical_count_of_buffered_step = _Buffer.init_new(
             item_shape=(
                 self._expert_location_metadata.num_layers,
@@ -1102,6 +1166,13 @@ class _CircularBuffer(_Buffer):
             (buffer_size, *item_shape), dtype=dtype, device=device
         )
         self._curr_index = 0
+
+    @staticmethod
+    def over(buffer: torch.Tensor) -> _CircularBuffer:
+        ans = _CircularBuffer.__new__(_CircularBuffer)
+        ans._buffer = buffer
+        ans._curr_index = 0
+        return ans
 
     def append(self, value: torch.Tensor):
         self._buffer[self._curr_index] = value
