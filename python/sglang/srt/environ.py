@@ -1553,6 +1553,8 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # DIAGNOSTIC ONLY: skip the per-forward elastic EP rank-fault check (cost measurement).
     SGLANG_DIAG_SKIP_RANK_FAULT_CHECK = EnvBool(False)
+    # DIAGNOSTIC ONLY: log the wall time of the per-step DP MLP sync collective (scheduler side).
+    SGLANG_DIAG_MLP_SYNC_TIMING = EnvBool(False)
     # DIAGNOSTIC ONLY: mix the EP rank into the dummy-weight seed of expert parameters.
     SGLANG_DIAG_DUMMY_EXPERT_SEED_BY_RANK = EnvBool(False)
     # DIAGNOSTIC ONLY: with the above, use the same expert seed on every rank (control run).

@@ -109,6 +109,30 @@ def _spec_input_cuda_graph_compatible(
     return spec_info is None or spec_info.cuda_graph_compatible
 
 
+_DIAG_MLP_SYNC = {"n": 0, "s": 0.0, "max": 0.0}
+
+
+def _diag_mlp_sync_timing(dt: float, *, use_world_group: bool, device) -> None:
+    """DIAGNOSTIC (SGLANG_DIAG_MLP_SYNC_TIMING=1): wall time of the per-step MLP sync collective,
+    logged as a mean over 500 steps."""
+    st = _DIAG_MLP_SYNC
+    st["n"] += 1
+    st["s"] += dt
+    st["max"] = max(st["max"], dt)
+    if st["n"] == 500:
+        import logging
+
+        logging.getLogger(__name__).info(
+            "[DIAG] mlp_sync all_gather: mean %.3f ms max %.3f ms over 500 steps "
+            "(world_group=%s device=%s)",
+            st["s"] / st["n"] * 1e3,
+            st["max"] * 1e3,
+            use_world_group,
+            device,
+        )
+        st.update(n=0, s=0.0, max=0.0)
+
+
 def _resolve_elastic_world_num_dp_ranks(
     num_dp_ranks: int,
     *,
@@ -723,11 +747,16 @@ def prepare_mlp_sync_batch_raw(
     if num_dp_ranks == 1:
         mlp_sync_info.finalize_local()
     elif not skip_all_gather:
+        t0 = time.perf_counter()
         mlp_sync_info.all_gather(
             device=device,
             group=group,
             use_all_reduce=use_world_group,
         )
+        if envs.SGLANG_DIAG_MLP_SYNC_TIMING.get():
+            _diag_mlp_sync_timing(
+                time.perf_counter() - t0, use_world_group=use_world_group, device=device
+            )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
     if shutdown_vote is not None and metadata_ready:
