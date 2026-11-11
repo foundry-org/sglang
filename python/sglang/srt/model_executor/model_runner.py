@@ -42,6 +42,7 @@ from sglang.srt.distributed import bootstrap
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
+    diag_agree_scale_progress,
     diag_nixl_recover_connect,
     diag_recover_expert_reload_filter,
     diag_recover_launch_map,
@@ -2693,9 +2694,20 @@ class ModelRunner:
             and time.monotonic() - state.pending_since
             > get_exec().moe.elastic_ep_scale_timeout
         )
-        timeout = state.active_ranks.new_tensor(int(local_timeout))
-        dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
-        if timeout.item():
+        agreed_cohort, peers_ready = None, None
+        if envs.SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS.get():
+            timed_out, agreed_cohort, peers_ready = diag_agree_scale_progress(
+                local_timeout=local_timeout,
+                waiting_for_cohort=state.scale_phase == "waiting_for_cohort",
+                effective_size=effective_size,
+                pending_size=pending_size,
+                like=state.active_ranks,
+            )
+        else:
+            timeout = state.active_ranks.new_tensor(int(local_timeout))
+            dist.all_reduce(timeout, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+            timed_out = bool(timeout.item())
+        if timed_out:
             error = f"Timed out waiting for ranks to join target EP size {pending_size}"
             ElasticEPStateManager.fail_scale(error)
             self._reset_eplb_after_elastic_scale_failure()
@@ -2705,7 +2717,11 @@ class ModelRunner:
             return
 
         if state.scale_phase == "waiting_for_cohort":
-            cohort = get_scale_cohort(effective_size)
+            cohort = (
+                agreed_cohort
+                if peers_ready is not None
+                else get_scale_cohort(effective_size)
+            )
             if cohort is None:
                 return
             if cohort.target_ep_size != pending_size:
@@ -2767,7 +2783,7 @@ class ModelRunner:
                 return
 
         ranks_to_join = list(range(effective_size, pending_size))
-        if not ranks_to_join:
+        if not ranks_to_join or peers_ready is False:
             return
 
         current_platform.synchronize()

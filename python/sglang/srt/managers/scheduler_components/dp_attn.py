@@ -204,6 +204,8 @@ class MLPSyncBatchInfo:
     is_shutting_down: bool = False
     # This rank's listener drain state (see DPDrainColumn).
     drain_state: int = 0
+    # DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS): noted elastic scale target, None = no column.
+    elastic_scale_request: Optional[int] = None
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
@@ -216,6 +218,10 @@ class MLPSyncBatchInfo:
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
+    agreed_elastic_scale_request: int = 0
+
+    def _elastic_column(self, value: int) -> list:
+        return [] if self.elastic_scale_request is None else [value]
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
         return torch.tensor(
@@ -233,6 +239,7 @@ class MLPSyncBatchInfo:
                 self.attention_pairs,
                 int(self.is_shutting_down),
                 self.drain_state,
+                *self._elastic_column(self.elastic_scale_request or 0),
             ],
             device=device,
             dtype=dtype,
@@ -254,6 +261,7 @@ class MLPSyncBatchInfo:
                 0,  # attention_pairs
                 0,  # is_shutting_down
                 DRAIN_STATE_NO_LISTENER,  # drain_state
+                *self._elastic_column(0),
             ],
             device=device,
             dtype=dtype,
@@ -267,6 +275,7 @@ class MLPSyncBatchInfo:
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
         self.any_shutting_down = self.is_shutting_down
+        self.agreed_elastic_scale_request = self.elastic_scale_request or 0
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -344,6 +353,8 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
+        if self.elastic_scale_request is not None:
+            self.agreed_elastic_scale_request = int(tp0_info_cpu[:, 13].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -743,6 +754,12 @@ def prepare_mlp_sync_batch_raw(
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
         drain_state=drain_column.local if drain_column is not None else 0,
     )
+    if envs.SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS.get():
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        mlp_sync_info.elastic_scale_request = (
+            ElasticEPStateManager.noted_scale_request()
+        )
 
     if num_dp_ranks == 1:
         mlp_sync_info.finalize_local()
@@ -759,6 +776,12 @@ def prepare_mlp_sync_batch_raw(
             )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if mlp_sync_info.elastic_scale_request is not None and metadata_ready:
+        from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+
+        ElasticEPStateManager.apply_agreed_scale_request(
+            mlp_sync_info.agreed_elastic_scale_request
+        )
     if shutdown_vote is not None and metadata_ready:
         shutdown_vote.any = mlp_sync_info.any_shutting_down
     if drain_column is not None and metadata_ready:

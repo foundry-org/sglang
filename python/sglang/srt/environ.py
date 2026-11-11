@@ -1553,6 +1553,12 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # DIAGNOSTIC ONLY: skip the per-forward elastic EP rank-fault check (cost measurement).
     SGLANG_DIAG_SKIP_RANK_FAULT_CHECK = EnvBool(False)
+    # DIAGNOSTIC ONLY: a scale request is activated on every DP rank in the same MLP-sync iteration.
+    SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS = EnvBool(False)
+    # DIAGNOSTIC ONLY: this TP rank applies a scale request only after its next forward (race injection; -1 off).
+    SGLANG_DIAG_ELASTIC_DELAY_SCALE_REQ_TP_RANK = EnvInt(-1)
+    # DIAGNOSTIC ONLY: this TP rank misses the joining cohort's TCPStore key once (race injection; -1 off).
+    SGLANG_DIAG_ELASTIC_DELAY_COHORT_TP_RANK = EnvInt(-1)
     # DIAGNOSTIC ONLY: log the wall time of the per-step DP MLP sync collective (scheduler side).
     SGLANG_DIAG_MLP_SYNC_TIMING = EnvBool(False)
     # DIAGNOSTIC ONLY: count torch.distributed collectives per group and caller, logged every 20 s.

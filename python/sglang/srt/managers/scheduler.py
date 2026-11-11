@@ -5489,6 +5489,7 @@ class Scheduler(
             collapse_physical_rank_status,
         )
 
+        ElasticEPStateManager.diag_release_deferred_scale_request()
         inst = ElasticEPStateManager.instance()
         if inst is not None and inst.active_ranks_cpu is not None:
             dp_status = collapse_physical_rank_status(
@@ -6497,6 +6498,17 @@ class Scheduler(
                 old_ep_size=old_ep_size,
                 new_ep_size=new_ep_size,
             )
+        consensus = envs.SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS.get()
+        if consensus and ElasticEPStateManager.get_pending_ep_size() == new_ep_size:
+            # Another rank's copy of this request was already activated through the MLP sync.
+            return ScaleElasticEPReqOutput(
+                success=True,
+                message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
+                old_ep_size=old_ep_size,
+                new_ep_size=new_ep_size,
+                pending_ep_size=new_ep_size,
+                scale_phase=ElasticEPStateManager.get_scale_phase(),
+            )
         if ElasticEPStateManager.is_scaling():
             return ScaleElasticEPReqOutput(
                 success=False,
@@ -6510,7 +6522,12 @@ class Scheduler(
                 scale_phase=ElasticEPStateManager.get_scale_phase(),
             )
 
-        if not ElasticEPStateManager.request_scale(new_ep_size):
+        delay_rank = envs.SGLANG_DIAG_ELASTIC_DELAY_SCALE_REQ_TP_RANK.get()
+        if delay_rank == get_parallel().tp_rank:
+            ElasticEPStateManager._diag_deferred_ep_size = new_ep_size
+        elif consensus:
+            ElasticEPStateManager.note_scale_request(new_ep_size)
+        elif not ElasticEPStateManager.request_scale(new_ep_size):
             return ScaleElasticEPReqOutput(
                 success=False,
                 message=(
@@ -6530,13 +6547,19 @@ class Scheduler(
             new_ep_size,
         )
 
+        # A noted or deferred request is activated later; the tokenizer tracks it as pending now.
+        activated = ElasticEPStateManager.get_pending_ep_size() is not None
         return ScaleElasticEPReqOutput(
             success=True,
             message=f"Scaling initiated from {old_ep_size} to {new_ep_size}",
             old_ep_size=old_ep_size,
             new_ep_size=new_ep_size,
-            pending_ep_size=ElasticEPStateManager.get_pending_ep_size(),
-            scale_phase=ElasticEPStateManager.get_scale_phase(),
+            pending_ep_size=new_ep_size,
+            scale_phase=(
+                ElasticEPStateManager.get_scale_phase()
+                if activated
+                else "waiting_for_cohort"
+            ),
         )
 
     def load_lora_adapter(

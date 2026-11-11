@@ -218,7 +218,57 @@ def get_scale_cohort(rank_offset: int) -> Optional[ScaleCohort]:
     key = f"{_SCALE_COHORT_KEY_PREFIX}/{rank_offset}"
     if not store.check([key]):
         return None
+    if _diag_hide_cohort_once():
+        return None
     return msgspec.json.decode(store.get(key), type=ScaleCohort)
+
+
+_DIAG_COHORT_HIDDEN = [False]
+
+
+def _diag_hide_cohort_once() -> bool:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_DELAY_COHORT_TP_RANK): that TP rank misses a present cohort once."""
+    from sglang.srt.environ import envs
+
+    if (
+        _DIAG_COHORT_HIDDEN[0]
+        or envs.SGLANG_DIAG_ELASTIC_DELAY_COHORT_TP_RANK.get() != get_parallel().tp_rank
+    ):
+        return False
+    _DIAG_COHORT_HIDDEN[0] = True
+    logger.info("[DIAG] cohort hidden from this rank for one forward")
+    return True
+
+
+def diag_agree_scale_progress(
+    *,
+    local_timeout: bool,
+    waiting_for_cohort: bool,
+    effective_size: int,
+    pending_size: int,
+    like: torch.Tensor,
+) -> tuple:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS): one WORLD all-reduce (MAX) agrees on the scale
+    timeout, the joining cohort's visibility and the joiners' peer readiness, so every rank takes the same
+    branch of the scale step in the same forward. Returns (timed_out, cohort, peers_ready)."""
+    from mooncake.pg import get_peer_state
+
+    cohort = get_scale_cohort(effective_size) if waiting_for_cohort else None
+    not_ready = 1
+    if cohort is not None or not waiting_for_cohort:
+        ranks = list(range(effective_size, pending_size))
+        world = torch.distributed.group.WORLD
+        not_ready = int(not (ranks and all(get_peer_state(world, ranks))))
+    flags = like.new_tensor([int(local_timeout), int(cohort is not None), not_ready])
+    torch.distributed.all_reduce(
+        flags, op=torch.distributed.ReduceOp.MAX, group=torch.distributed.group.WORLD
+    )
+    timed_out, any_cohort, any_not_ready = flags.tolist()
+    if any_cohort and waiting_for_cohort and cohort is None:
+        # Another rank saw the cohort key: it exists, so this blocking read returns at once.
+        key = f"{_SCALE_COHORT_KEY_PREFIX}/{effective_size}"
+        cohort = msgspec.json.decode(get_global_tcp_store().get(key), type=ScaleCohort)
+    return bool(timed_out), cohort, not any_not_ready
 
 
 def validate_scale_cohort_topology(cohort: ScaleCohort) -> None:
@@ -293,6 +343,11 @@ class ElasticEPState:
 class ElasticEPStateManager:
     _instance: Optional[ElasticEPState] = None
     _on_scale: Optional[Callable[[int, int], None]] = None
+    # DIAGNOSTIC (SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS): a scale request this rank received but has
+    # not activated; the MLP sync carries it, so every rank activates it in the same iteration.
+    _noted_ep_size: Optional[int] = None
+    # DIAGNOSTIC (SGLANG_DIAG_ELASTIC_DELAY_SCALE_REQ_TP_RANK): a request held back until after the next forward.
+    _diag_deferred_ep_size: Optional[int] = None
 
     @classmethod
     def instance(cls) -> ElasticEPState:
@@ -396,6 +451,41 @@ class ElasticEPStateManager:
         inst.last_error = None
         inst.pending_since = time.monotonic()
         return True
+
+    @classmethod
+    def note_scale_request(cls, n: int) -> None:
+        cls._noted_ep_size = n
+
+    @classmethod
+    def noted_scale_request(cls) -> int:
+        return cls._noted_ep_size or 0
+
+    @classmethod
+    def apply_agreed_scale_request(cls, n: int) -> None:
+        """Activate the largest scale request any rank has noted (the MLP-sync maximum)."""
+        inst = cls._instance
+        if n <= 0 or inst is None:
+            return
+        if inst.pending_ep_size is None and n > inst.effective_ep_size:
+            cls.request_scale(n)
+            logger.info("[DIAG] scale request %d activated by the MLP sync", n)
+        noted = cls._noted_ep_size
+        if noted is not None and inst.pending_ep_size == noted:
+            cls._noted_ep_size = None
+
+    @classmethod
+    def diag_release_deferred_scale_request(cls) -> None:
+        n = cls._diag_deferred_ep_size
+        if n is None:
+            return
+        cls._diag_deferred_ep_size = None
+        from sglang.srt.environ import envs
+
+        if envs.SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS.get():
+            cls.note_scale_request(n)
+        else:
+            cls.request_scale(n)
+        logger.info("[DIAG] deferred scale request %d released after a forward", n)
 
     @classmethod
     def begin_scale(cls) -> bool:
