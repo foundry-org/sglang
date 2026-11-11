@@ -119,7 +119,12 @@ class NixlEPBuffer:
         """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NIXL_RECOVER): a survivor drops the dead peers'
         connections and connects their restarted processes (same rank ids)."""
         state = cls._state()
-        state.buffer.disconnect_ranks(ranks)
+        # Ranks absent since boot (PARTIAL_START) were never connected: nothing to drop.
+        never = set(state.diag_recover_pending or [])
+        if [r for r in ranks if r not in never]:
+            state.buffer.disconnect_ranks([r for r in ranks if r not in never])
+        if never:
+            state.diag_recover_pending = [r for r in never if r not in ranks] or None
         cls._connect_ranks(state, ranks, tag="recover")
         return cls._diag_mask_after_recover(state)
 
@@ -262,8 +267,9 @@ class NixlEPBuffer:
             state.connected_ep_size = 0
         elif (
             get_exec().moe.ep_join_mode == "recover"
-            and envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get()
-        ):
+            or envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get()
+        ) and envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get():
+            # (PARTIAL_START: a node booting without the absent ranks connects only its own ranks too.)
             # DIAGNOSTIC: a restarted node connects its own ranks now; the survivors are reachable
             # only after the PG recovery, where diag_connect_recover_pending connects them.
             node_size = world_size // get_parallel().nnodes

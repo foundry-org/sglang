@@ -575,8 +575,14 @@ class GroupCoordinator:
         )
 
         self.mq_broadcaster: Optional[MessageQueue] = None
-        if use_message_queue_broadcaster and self.world_size > 1 and not recovered_rank:
+        if (
+            use_message_queue_broadcaster
+            and self.world_size > 1
+            and not recovered_rank
+            and not envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get()
+        ):
             # Recovered ranks create their mq_broadcaster in elastic_ep.py
+            # (PARTIAL_START: its readers are absent at boot; the recovery creates it.)
             self.mq_broadcaster = MessageQueue.create_from_process_group(
                 self.cpu_group, 1 << 22, 6
             )
@@ -2483,6 +2489,32 @@ def _create_global_tcp_store(
         )
 
 
+def _diag_partial_start_store(
+    init_method: str, *, rank: int, world_size: int, timeout: Optional[timedelta]
+):
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_PARTIAL_START): the tcp:// rendezvous store of
+    init_process_group, but rank 0 does not wait for all world_size ranks to connect."""
+    if not envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get() or not init_method.startswith(
+        "tcp://"
+    ):
+        return None
+    from torch.distributed import PrefixStore, TCPStore
+
+    host, port = init_method[len("tcp://") :].rsplit(":", 1)
+    store = TCPStore(
+        host_name=host,
+        port=int(port),
+        world_size=world_size,
+        is_master=rank == 0,
+        timeout=timeout or timedelta(minutes=30),
+        multi_tenant=True,
+        wait_for_workers=False,
+    )
+    logger.info("[DIAG] partial start: rendezvous store without waiting for workers")
+    # Same key prefix as the tcp:// path, so later ranks joining through the URL see the same keys.
+    return PrefixStore("default_pg", store)
+
+
 def init_distributed_environment(
     world_size: int = -1,
     rank: int = -1,
@@ -2531,10 +2563,14 @@ def init_distributed_environment(
         else:
             pg_options = get_torch_distributed_pg_options()
 
+        diag_store = _diag_partial_start_store(
+            distributed_init_method, rank=rank, world_size=world_size, timeout=timeout
+        )
         # this backend is used for WORLD
         torch.distributed.init_process_group(
             backend=backend,
-            init_method=distributed_init_method,
+            init_method=None if diag_store is not None else distributed_init_method,
+            store=diag_store,
             world_size=world_size,
             rank=rank,
             timeout=timeout,

@@ -1583,6 +1583,8 @@ class Envs:
     SGLANG_DIAG_ELASTIC_SCALE_TIMELINE = EnvBool(False)
     # DIAGNOSTIC ONLY: NIXL rank recovery: a restarted node connects its own ranks at init, survivors reconnect it after the PG recovery.
     SGLANG_DIAG_ELASTIC_NIXL_RECOVER = EnvBool(False)
+    # Boot without the ranks of MOONCAKE_PG_DIAG_BOOT_ABSENT_RANKS; they join later through recover.
+    SGLANG_DIAG_ELASTIC_PARTIAL_START = EnvBool(False)
     # DIAGNOSTIC ONLY: with the above, a restarted rank reloads its routed experts from disk when the recovery broadcast moved its slots.
     SGLANG_DIAG_ELASTIC_RECOVER_RELOAD_EXPERTS = EnvBool(False)
     # DIAGNOSTIC ONLY: once the Mooncake PG evicts a rank, mask it in the NIXL EP buffer and tell the DP controller (no NIXL timeout).

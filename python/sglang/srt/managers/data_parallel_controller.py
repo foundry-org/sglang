@@ -514,9 +514,14 @@ class DataParallelController:
 
         if get_parallel().node_rank == 0:
             # Node 0: Broadcast worker ports to all other nodes
-            return self._broadcast_ports_as_server(
-                endpoint, get_parallel().nnodes - 1, worker_ports
+            # DIAGNOSTIC (SGLANG_DIAG_ELASTIC_PARTIAL_START): the other nodes are absent at boot and
+            # get the ports from the elastic reply thread when they join.
+            expected = (
+                0
+                if envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get()
+                else get_parallel().nnodes - 1
             )
+            return self._broadcast_ports_as_server(endpoint, expected, worker_ports)
         else:
             # Other nodes: Receive worker ports from node 0
             return self._receive_ports_as_client(endpoint).worker_ports

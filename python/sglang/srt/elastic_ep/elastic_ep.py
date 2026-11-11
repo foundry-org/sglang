@@ -134,6 +134,9 @@ def diag_pg_fault_unblock(*, send_to_tokenizer: Callable) -> None:
         return
     mirror = _diag_pg_active_mirror()
     last = _DiagPgFaultWatch.last_mirror
+    if last is None and envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get():
+        # Ranks absent since boot are handled like ranks the PG evicted at the first poll.
+        last = [1] * len(mirror)
     _DiagPgFaultWatch.last_mirror = mirror
     if last is None:
         return
