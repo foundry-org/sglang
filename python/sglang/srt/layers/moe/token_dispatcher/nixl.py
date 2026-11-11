@@ -243,6 +243,8 @@ class NixlEPBuffer:
             tcp_store_group=tcp_store,
             **timeout_kwargs,
         )
+        if timeout_kwargs:
+            logger.info(f"[DIAG] NIXL EP Buffer created with {timeout_kwargs}")
 
         state.buffer.update_memory_buffers(
             num_ranks=nixl_max_ranks,
