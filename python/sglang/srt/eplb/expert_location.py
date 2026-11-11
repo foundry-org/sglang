@@ -596,6 +596,7 @@ def broadcast_global_expert_location_metadata(
     if (
         envs.SGLANG_DIAG_ELASTIC_JOINER_INIT_LOAD.get()
         or envs.SGLANG_DIAG_ELASTIC_NIXL_RECOVER.get()
+        or envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 1
     ):
         # DIAGNOSTIC: build on the host and write into the existing capacity-backed
         # device tensors, so the joiner allocates no device memory here; captured graphs
@@ -615,6 +616,26 @@ def broadcast_global_expert_location_metadata(
     )
     set_global_expert_location_metadata(metadata, allow_overwrite=True)
     return metadata
+
+
+def diag_expand_metadata_in_place(
+    metadata: ExpertLocationMetadata,
+    *,
+    model_config: ModelConfig,
+    physical_to_logical_map: torch.Tensor,
+    moe_ep_rank: int,
+) -> bool:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS=1): the scale-up expansion written into
+    the launch-time device tensors. A kept decode graph reads logical_to_rank_dispatch_physical_map
+    by address; a new metadata object leaves it on the launch-time tensor, which no later EPLB
+    update reaches."""
+    host = ExpertLocationMetadata.init_by_mapping(
+        model_config,
+        physical_to_logical_map.cpu(),
+        moe_ep_rank=moe_ep_rank,
+        device=torch.device("cpu"),
+    )
+    return _diag_copy_metadata_in_place(metadata, host)
 
 
 def _diag_copy_metadata_in_place(

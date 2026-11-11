@@ -76,6 +76,7 @@ from sglang.srt.eplb.expert_location import (
     append_trivial_expert_slots,
     broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
+    diag_expand_metadata_in_place,
     format_expert_location_layout,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -2398,6 +2399,15 @@ class ModelRunner:
             metadata.num_logical_experts,
             start=old_num_physical - num_local * initial_ep_size,
         )
+        if envs.SGLANG_DIAG_ELASTIC_KEEP_PRIMARY_GRAPHS.get() == 1 and (
+            diag_expand_metadata_in_place(
+                metadata,
+                model_config=self.model_config,
+                physical_to_logical_map=expanded_p2l,
+                moe_ep_rank=self._elastic_global_rank(),
+            )
+        ):
+            return
         new_metadata = ExpertLocationMetadata.init_by_mapping(
             self.model_config,
             physical_to_logical_map=expanded_p2l,
