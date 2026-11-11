@@ -1553,6 +1553,8 @@ class Envs:
     SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     # DIAGNOSTIC ONLY: skip the per-forward elastic EP rank-fault check (cost measurement).
     SGLANG_DIAG_SKIP_RANK_FAULT_CHECK = EnvBool(False)
+    # DIAGNOSTIC ONLY: the per-forward rank-fault check polls a non-blocking copy of the active ranks.
+    SGLANG_DIAG_ELASTIC_ASYNC_FAULT_CHECK = EnvBool(False)
     # DIAGNOSTIC ONLY: a scale request is activated on every DP rank in the same MLP-sync iteration.
     SGLANG_DIAG_ELASTIC_SCALE_REQ_CONSENSUS = EnvBool(False)
     # DIAGNOSTIC ONLY: this TP rank applies a scale request only after its next forward (race injection; -1 off).

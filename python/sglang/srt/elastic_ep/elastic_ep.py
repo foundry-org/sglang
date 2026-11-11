@@ -145,6 +145,8 @@ def diag_pg_fault_unblock(*, send_to_tokenizer: Callable) -> None:
         from sglang.srt.layers.moe.token_dispatcher.nixl import NixlEPBuffer
 
         NixlEPBuffer.diag_mask_ranks(evicted)
+    # The next forwards read the mask: check them synchronously so the faulted forward is redone.
+    ElasticEPStateManager.instance().blocking_checks = 2
     from sglang.srt.elastic_ep.topology import (
         attn_replica_size,
         collapse_physical_rank_status,
@@ -317,9 +319,38 @@ class ElasticEPState:
     original_ep_size: int = 0
     has_scaled: bool = False
     ep_join_rank_offset: int = 0
+    # DIAGNOSTIC (SGLANG_DIAG_ELASTIC_ASYNC_FAULT_CHECK): non-blocking poll of active_ranks.
+    poll_host: Optional[torch.Tensor] = None
+    poll_event: Optional[torch.cuda.Event] = None
+    poll_pending: bool = False
+    # Forwards that still take the blocking check; set by a host-side fault signal (PG eviction).
+    blocking_checks: int = 0
 
     def is_active_equal_last(self) -> bool:
         return torch.equal(self.active_ranks, self.last_active_ranks)
+
+    def poll_active_changed(self) -> bool:
+        """Whether the blocking comparison should run after this forward: a host fault signal is
+        pending, or the last finished device-to-host copy of active_ranks (one forward late) differs
+        from the host snapshot. Never waits on the device."""
+        if self.blocking_checks > 0:
+            self.blocking_checks -= 1
+            return True
+        if self.poll_event is None:
+            self.poll_host = torch.empty(
+                self.active_ranks.shape, dtype=self.active_ranks.dtype, pin_memory=True
+            )
+            self.poll_event = torch.cuda.Event()
+        elif self.poll_pending:
+            if not self.poll_event.query():
+                return False
+            self.poll_pending = False
+            if not torch.equal(self.poll_host, self.active_ranks_cpu):
+                return True
+        self.poll_host.copy_(self.active_ranks, non_blocking=True)
+        self.poll_event.record()
+        self.poll_pending = True
+        return False
 
     def sync_active_to_cpu(self):
         if self.active_ranks is not None:
@@ -817,8 +848,17 @@ def maybe_recover_ep_ranks(
 
 
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
+    from sglang.srt.environ import envs
+
     elastic_ep_state = ElasticEPStateManager.instance()
-    if elastic_ep_state is None or elastic_ep_state.is_active_equal_last():
+    if elastic_ep_state is None:
+        return False
+    if (
+        envs.SGLANG_DIAG_ELASTIC_ASYNC_FAULT_CHECK.get()
+        and not elastic_ep_state.poll_active_changed()
+    ):
+        return False
+    if elastic_ep_state.is_active_equal_last():
         return False
     elastic_ep_state.snapshot_active_to_last()
     elastic_ep_state.sync_active_to_cpu()
