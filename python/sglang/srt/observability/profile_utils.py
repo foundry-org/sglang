@@ -356,6 +356,10 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         if not _is_npu:
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
+            if (
+                get_parallel().ep_join_rank_offset
+            ):  # DIAGNOSTIC: elastic joiners reuse tp_rank 0..
+                filename_parts.append(f"JOIN-{get_parallel().ep_join_rank_offset}")
 
             # Only add other ranks if parallelism is enabled (size > 1)
             if get_parallel().num_dp_ranks > 1:
