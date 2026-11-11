@@ -268,13 +268,28 @@ class DataParallelController:
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if worker is not None and self.status[i]:
-                sock_send(worker, obj)
+                self._send_to_worker(slot=i, obj=obj)
 
     def send_control_message(self, obj):
         for i in self._active_workers[:: self.control_message_step]:
             worker = self.workers[i]
             if worker is not None:
-                sock_send(worker, obj)
+                self._send_to_worker(slot=i, obj=obj)
+
+    def _send_to_worker(self, *, slot: int, obj) -> None:
+        if not envs.SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK.get():
+            sock_send(self.workers[slot], obj)
+            return
+        # DIAGNOSTIC: a broadcast (abort, control message) to a worker whose process died blocks this loop
+        # like a routed request does; drop it for that worker instead (zmq.Again: the PUSH socket has no pipe).
+        try:
+            sock_send(self.workers[slot], obj, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            logger.info(
+                "[DIAG] DP worker %d unreachable (zmq.Again), %s dropped for it",
+                slot,
+                type(obj).__name__,
+            )
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if len(ranks.status) != self.max_dp_size:
@@ -849,7 +864,7 @@ class DataParallelController:
             active
         )
         logger.debug(f"Choose worker {slot} for health check")
-        sock_send(self.workers[slot], req)
+        self._send_to_worker(slot=slot, obj=req)
 
     def maybe_external_dp_rank_routing(self, req: Req):
         if req.routed_dp_rank is not None:
