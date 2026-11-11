@@ -107,6 +107,20 @@ class _DiagPgFaultWatch:
     last_mirror: Optional[List[int]] = None
 
 
+def _diag_pg_active_mirror() -> List[int]:
+    """Active ranks as the PG sees them, host memory only. The launch-time TP group holds only the launch ranks;
+    after a scale-up the admitted ranks are only in WORLD, whose Mooncake size is the upper bound of the active
+    rank space (`MooncakeCommunicator::getSize`), so there only an eviction of the highest ranks is seen."""
+    mirror = get_parallel().tp_group.active_ranks_cpu.tolist()
+    if not elastic_expanded_world_enabled() or ElasticEPStateManager.is_scaling():
+        return mirror
+    world_size = torch.distributed.get_world_size()
+    return [
+        mirror[r] if r < len(mirror) else int(r < world_size)
+        for r in range(ElasticEPStateManager.get_effective_ep_size())
+    ]
+
+
 def diag_pg_fault_unblock(*, send_to_tokenizer: Callable) -> None:
     """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK): act on a Mooncake PG eviction before any NIXL timeout.
 
@@ -118,7 +132,7 @@ def diag_pg_fault_unblock(*, send_to_tokenizer: Callable) -> None:
 
     if not envs.SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK.get():
         return
-    mirror = get_parallel().tp_group.active_ranks_cpu.tolist()
+    mirror = _diag_pg_active_mirror()
     last = _DiagPgFaultWatch.last_mirror
     _DiagPgFaultWatch.last_mirror = mirror
     if last is None:

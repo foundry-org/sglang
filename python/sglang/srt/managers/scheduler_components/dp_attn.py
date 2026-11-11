@@ -140,7 +140,12 @@ def _resolve_elastic_world_num_dp_ranks(
             f"local_num_tokens={local_num_tokens} "
             f"local_forward_mode={local_forward_mode}"
         )
-    if effective_ep_size > world_size:
+    # DIAGNOSTIC: an eviction of admitted ranks shrinks the Mooncake WORLD size below the EP size; the
+    # all-reduce below keeps fixed global slots and decodes the evicted ranks' empty rows as IDLE.
+    if (
+        effective_ep_size > world_size
+        and not envs.SGLANG_DIAG_ELASTIC_PG_FAULT_UNBLOCK.get()
+    ):
         raise RuntimeError(
             "[Elastic EP] WORLD MLP sync EP size exceeds WORLD size: "
             f"rank={torch.distributed.get_rank(group)} "
