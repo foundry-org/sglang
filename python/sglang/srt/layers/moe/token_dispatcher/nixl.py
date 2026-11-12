@@ -133,9 +133,15 @@ class NixlEPBuffer:
         """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_NIXL_RECOVER): a restarted rank connects the survivors."""
         state = cls._state()
         ranks = state.diag_recover_pending or []
+        later = []
+        if envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get():
+            # Ranks the PG has not admitted (absent since boot) stay pending for a later recovery.
+            active = get_parallel().tp_group.active_ranks_cpu.tolist()
+            later = [r for r in ranks if not active[r]]
+            ranks = [r for r in ranks if active[r]]
         if ranks:
             cls._connect_ranks(state, ranks, tag="recover")
-        state.diag_recover_pending = None
+        state.diag_recover_pending = later or None
         return ranks, cls._diag_mask_after_recover(state)
 
     @classmethod

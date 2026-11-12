@@ -370,6 +370,12 @@ class ElasticEPState:
             # Reserved slots stay inactive until their ranks join.
             self.active_ranks.zero_()
             self.active_ranks[: self.effective_ep_size] = 1
+            from sglang.srt.environ import envs
+
+            if envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get():
+                # DIAGNOSTIC: ranks absent since boot stay inactive until the PG admits them.
+                pg = get_parallel().tp_group.active_ranks
+                self.active_ranks[: pg.numel()].mul_(pg.to(self.active_ranks.dtype))
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
 
@@ -706,6 +712,15 @@ def _wait_for_peer_state(backend, ranks: List[int]) -> None:
 def _maybe_create_message_queue(group) -> None:
     if not group.use_message_queue_broadcaster or group.world_size <= 1:
         return
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get() and not bool(
+        group.active_ranks_cpu.all()
+    ):
+        # DIAGNOSTIC: the writer would wait for readers that do not exist (virtual world larger
+        # than the live ranks); broadcast_object falls back to the process group.
+        group.mq_broadcaster = None
+        return
 
     from sglang.srt.distributed.device_communicators.shm_broadcast import MessageQueue
 
@@ -792,7 +807,20 @@ def get_healthy_expert_location_src_rank(
     # A rank that was started as a rejoin rank may later act as a healthy
     # rank in a subsequent recovery cycle.
     local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
-    gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get():
+        # DIAGNOSTIC: slots of ranks that never joined are not written by the gather (an
+        # all_gather_object would size and unpickle garbage there); they keep -1 = not a source.
+        flags = torch.full((world_group.world_size,), -1, dtype=torch.int32)
+        torch.distributed.all_gather_into_tensor(
+            flags,
+            torch.tensor([int(local_rejoin_flag)], dtype=torch.int32),
+            group=world_group.cpu_group,
+        )
+        gathered_rejoin_flags = [f != 0 for f in flags.tolist()]
+    else:
+        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
 
     for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
         if not is_rejoin_rank:
@@ -802,6 +830,23 @@ def get_healthy_expert_location_src_rank(
         "No healthy rank found for broadcasting expert location metadata. "
         "All ranks are marked as elastic_ep_rejoin."
     )
+
+
+def _diag_partial_ready_block(ranks: List[int]) -> List[int]:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_PARTIAL_START): with ranks that may never come (virtual world
+    larger than the hardware), recover the lowest node whose ranks are all ready instead of all ranks."""
+    from sglang.srt.environ import envs
+
+    if not ranks or not envs.SGLANG_DIAG_ELASTIC_PARTIAL_START.get():
+        return ranks
+    from mooncake.pg import get_peer_state
+
+    node_size = get_parallel().tp_size // get_parallel().nnodes
+    for first in sorted({r // node_size * node_size for r in ranks}):
+        block = [r for r in ranks if first <= r < first + node_size]
+        if all(get_peer_state(torch.distributed.group.WORLD, block)):
+            return block
+    return []
 
 
 def maybe_recover_ep_ranks(
@@ -829,6 +874,7 @@ def maybe_recover_ep_ranks(
         i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
     ]
 
+    ranks_to_recover = _diag_partial_ready_block(ranks_to_recover)
     # try_recover_ranks polls peer state via Mooncake EP backend.
     # Mooncake's internal semantics guarantee that all ranks observe
     # consistent peer readiness state, so collective operations below
