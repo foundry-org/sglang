@@ -44,6 +44,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     ElasticEPStateManager,
     diag_agree_scale_progress,
     diag_nixl_recover_connect,
+    diag_rebalance_after_recover,
     diag_recover_expert_reload_filter,
     diag_recover_launch_map,
     diag_scale_timeline,
@@ -1170,6 +1171,7 @@ class ModelRunner:
 
         ElasticEPStateManager.instance().reset()
         diag_nixl_recover_connect(restarted_ranks=None, launch_map=launch_map)
+        diag_rebalance_after_recover(eplb_manager=self.eplb_manager)
 
     def init_attention_backends(self):
         """Initialize attention backends only (no cuda graph capture)."""

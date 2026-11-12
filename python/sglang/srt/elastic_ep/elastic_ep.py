@@ -891,9 +891,37 @@ def maybe_recover_ep_ranks(
         ElasticEPStateManager.instance().reset()
         diag_nixl_recover_connect(restarted_ranks=ranks_to_recover)
         logger.info(f"recover ranks {ranks_to_recover} done")
+        diag_rebalance_after_recover(eplb_manager=eplb_manager)
         return True
 
     return False
+
+
+def diag_rebalance_after_recover(*, eplb_manager: Optional[EPLBManager]) -> None:
+    """DIAGNOSTIC (SGLANG_DIAG_ELASTIC_REBALANCE_AFTER_RECOVER=K): one EPLB rebalance K forwards after a recovery.
+    The fault rebalance placed every expert on the survivors only (elasticity_aware.py gives inactive ranks
+    empty slots) and the recovery keeps that map, so the recovered ranks get no expert work until a rebalance.
+    Survivors arm it at the end of maybe_recover_ep_ranks, restarted ranks at the end of
+    post_capture_elastic_ep_recover; the DP ranks run forwards in lock step, so all reach K together."""
+    from sglang.srt.environ import envs
+
+    k = envs.SGLANG_DIAG_ELASTIC_REBALANCE_AFTER_RECOVER.get()
+    if k <= 0 or eplb_manager is None:
+        return
+
+    def _once():
+        for _ in range(k):
+            yield
+        state = ElasticEPStateManager.instance()
+        logger.info(
+            "[DIAG] EPLB rebalance %d forwards after recovery, active_ranks=%s",
+            k,
+            state.active_ranks.tolist() if state is not None else None,
+        )
+        yield from eplb_manager.rebalance()
+        yield from eplb_manager._entrypoint()
+
+    eplb_manager._main_generator = _once()
 
 
 def maybe_rebalance_after_rank_fault(*, eplb_manager: EPLBManager) -> bool:
