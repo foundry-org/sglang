@@ -1587,6 +1587,8 @@ class Envs:
     SGLANG_DIAG_ELASTIC_PARTIAL_START = EnvBool(False)
     # DIAGNOSTIC ONLY: one EPLB rebalance this many forwards after an elastic recovery (0 = off; the recovered ranks get no experts otherwise).
     SGLANG_DIAG_ELASTIC_REBALANCE_AFTER_RECOVER = EnvInt(0)
+    # DIAGNOSTIC ONLY: the per-forward elastic recover check reads only the PG host mirror (no device sync).
+    SGLANG_DIAG_ELASTIC_HOST_RECOVER_POLL = EnvBool(False)
     # DIAGNOSTIC ONLY: with the above, a restarted rank reloads its routed experts from disk when the recovery broadcast moved its slots.
     SGLANG_DIAG_ELASTIC_RECOVER_RELOAD_EXPERTS = EnvBool(False)
     # DIAGNOSTIC ONLY: once the Mooncake PG evicts a rank, mask it in the NIXL EP buffer and tell the DP controller (no NIXL timeout).

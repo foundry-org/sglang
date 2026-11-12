@@ -861,12 +861,20 @@ def maybe_recover_ep_ranks(
     # This check only runs when `--elastic-ep-backend` is enabled, so the
     # synchronization overhead does not propagate to other configs.
     # Leave for future optimization of the elastic EP path.
-    if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
-        return False
+    from sglang.srt.environ import envs
 
-    tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
-    tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
-    tp_active_ranks &= tp_active_ranks_cpu
+    if envs.SGLANG_DIAG_ELASTIC_HOST_RECOVER_POLL.get():
+        # DIAGNOSTIC: the PG's host mirror only (no device sync, no device-to-host copies per forward).
+        tp_active_ranks = tp_group.active_ranks_cpu.numpy()
+        if tp_active_ranks.all():
+            return False
+    else:
+        if tp_group.active_ranks.all() and tp_group.active_ranks_cpu.all():
+            return False
+
+        tp_active_ranks = tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
     # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
     # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
     # tp-group index is the same as the global rank index.
